@@ -26,9 +26,9 @@ CREATE INDEX IF NOT EXISTS idx_code ON requests(code);
 CREATE INDEX IF NOT EXISTS idx_status ON requests(status);
 """
 
-# pending: 等管理员处理 / downloading: 下载中 / uploaded: 已传Drive待入库
-# fulfilled: 已入库 / cancelled: 已取消 / failed: 失败
-ACTIVE_STATUSES = ("pending", "downloading", "uploaded")
+# pending: 等管理员处理 / downloading: 下载中 / uploading: 上传Drive中
+# uploaded: 已传Drive待入库 / fulfilled: 已入库 / cancelled: 已取消 / failed: 失败
+ACTIVE_STATUSES = ("pending", "downloading", "uploading", "uploaded")
 
 
 def _conn():

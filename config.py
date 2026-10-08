@@ -31,6 +31,9 @@ class Config:
     # 调度
     CHECK_INTERVAL_MIN: int = int(_get("CHECK_INTERVAL_MIN", "30") or 30)
 
+    # 求片后自动下载（中文优先的最优磁力），默认开
+    AUTO_DOWNLOAD: bool = _get("AUTO_DOWNLOAD", "true").lower() not in ("0", "false", "no")
+
     # 搜番相关（复用 javdb-ss 逻辑）
     MAGNET_COUNT: int = int(_get("MAGNET_COUNT", "3") or 3)
     RATE_LIMIT_SECONDS: int = int(_get("RATE_LIMIT_SECONDS", "3") or 3)
