@@ -1,0 +1,150 @@
+"""磁力选择性下载：aria2 取元数据 → 纯 Python 解析 torrent → 只下载最大的视频文件。
+
+推荐下载工具：aria2（轻量、快、支持磁力 + select-file）。
+安装：apt install aria2 / yum install aria2 / brew install aria2
+"""
+import asyncio
+import logging
+import os
+import re
+import subprocess
+import tempfile
+
+from config import config
+
+log = logging.getLogger(__name__)
+
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m2ts", ".ts", ".mpg"}
+
+
+# ---------- 纯 Python bencode 解析 ----------
+def _bdecode(data: bytes):
+    def parse(i):
+        c = data[i:i + 1]
+        if c == b"i":
+            j = data.index(b"e", i)
+            return int(data[i + 1:j]), j + 1
+        if c == b"l":
+            lst, i = [], i + 1
+            while data[i:i + 1] != b"e":
+                v, i = parse(i)
+                lst.append(v)
+            return lst, i + 1
+        if c == b"d":
+            dct, i = {}, i + 1
+            while data[i:i + 1] != b"e":
+                k, i = parse(i)
+                v, i = parse(i)
+                dct[k] = v
+            return dct, i + 1
+        if c.isdigit():
+            j = data.index(b":", i)
+            n = int(data[i:j])
+            return data[j + 1:j + 1 + n], j + 1 + n
+        raise ValueError(f"bencode parse error at {i}")
+    v, _ = parse(0)
+    return v
+
+
+def _pick_largest_video(torrent_path: str) -> tuple[int, str, int] | None:
+    """返回 (aria2的1-based文件序号, 文件名, 大小)。"""
+    with open(torrent_path, "rb") as f:
+        info = _bdecode(f.read())[b"info"]
+    files = info.get(b"files")
+    candidates = []
+    if files:  # 多文件
+        for idx, fl in enumerate(files):
+            path = "/".join(p.decode("utf-8", "ignore") for p in fl[b"path"])
+            size = int(fl[b"length"])
+            ext = os.path.splitext(path)[1].lower()
+            if ext in VIDEO_EXTS and size > 50 * 1024 * 1024:  # >50MB 才算正片
+                candidates.append((idx + 1, path, size))
+    else:  # 单文件
+        name = info[b"name"].decode("utf-8", "ignore")
+        size = int(info[b"length"])
+        if os.path.splitext(name)[1].lower() in VIDEO_EXTS:
+            candidates.append((1, name, size))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    return candidates[0]
+
+
+def _is_magnet(s: str) -> bool:
+    return s.strip().lower().startswith("magnet:?")
+
+
+async def _run_aria2(*args: str, timeout: int = 300) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        config.ARIA2_BIN, *args,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout)
+        return proc.returncode, (out + err).decode("utf-8", "ignore")[-500:]
+    except asyncio.TimeoutError:
+        proc.kill()
+        return -1, "timeout"
+
+
+async def download_largest_video(magnet: str, dest_dir: str,
+                                 on_progress=None) -> tuple[str | None, str]:
+    """下载磁力中最大的视频文件。返回 (本地文件路径, 说明)。"""
+    magnet = magnet.strip()
+    if not _is_magnet(magnet):
+        return None, "不是有效的磁力链接"
+    os.makedirs(dest_dir, exist_ok=True)
+
+    # 1) 取元数据
+    meta_dir = tempfile.mkdtemp(prefix="meta_")
+    rc, log_tail = await _run_aria2(
+        "--bt-metadata-only=true", "--bt-save-metadata=true",
+        f"--dir={meta_dir}", "--seed-time=0",
+        "--bt-tracker-connect-timeout=20",
+        magnet, timeout=180,
+    )
+    torrents = [f for f in os.listdir(meta_dir) if f.endswith(".torrent")]
+    if not torrents:
+        return None, f"获取种子元数据失败（{log_tail[-120:]}）"
+    pick = _pick_largest_video(os.path.join(meta_dir, torrents[0]))
+
+    if not pick:
+        return None, "磁力里没找到大于 50MB 的视频文件"
+    file_idx, file_name, file_size = pick
+    log.info("selected file #%d %s (%.1fGB)", file_idx, file_name, file_size / 1e9)
+
+    # 2) 只下载选中的文件
+    rc, log_tail = await _run_aria2(
+        f"--select-file={file_idx}", f"--dir={dest_dir}",
+        "--seed-time=0", "--bt-enable-lpd=true",
+        "--max-connection-per-server=8", "--split=8",
+        magnet, timeout=7200,
+    )
+    # 找下载好的文件（aria2 保持原目录结构）
+    base = os.path.basename(file_name)
+    found = None
+    for root, _, files in os.walk(dest_dir):
+        if base in files:
+            found = os.path.join(root, base)
+            break
+        # 兜底：找 dest_dir 里最新的大视频文件
+    if not found:
+        cands = []
+        for root, _, files in os.walk(dest_dir):
+            for fn in files:
+                if os.path.splitext(fn)[1].lower() in VIDEO_EXTS:
+                    p = os.path.join(root, fn)
+                    cands.append((os.path.getsize(p), p))
+        if cands:
+            cands.sort(reverse=True)
+            found = cands[0][1]
+    if not found:
+        return None, "下载完成但找不到视频文件"
+    if on_progress:
+        try:
+            on_progress(found)
+        except Exception:
+            pass
+    return found, f"{file_name} ({file_size / 1e9:.1f}GB)"
