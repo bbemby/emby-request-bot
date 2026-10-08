@@ -18,14 +18,46 @@ log = logging.getLogger(__name__)
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m2ts", ".ts", ".mpg"}
 
-# 公开 tracker，帮助 DHT 更快找到 peer（元数据阶段很关键）
+# 公开 tracker（来源：github.com/ngosang/trackerslist trackers_best.txt），
+# 帮助 DHT/元数据阶段更快找到 peer
 TRACKERS = ",".join([
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://open.stealth.si:80/announce",
     "udp://tracker.torrent.eu.org:451/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.skynetcloud.site:6969/announce",
+    "udp://tracker.qu.ax:6969/announce",
+    "udp://tracker.tryhackx.org:6969/announce",
+    "udp://tracker.nyaa.vc:6969/announce",
+    "udp://tracker.corpscorp.online:80/announce",
+    "udp://tracker.bittor.pw:1337/announce",
+    "udp://tracker-udp.gbitt.info:80/announce",
     "udp://explodie.org:6969/announce",
-    "udp://tracker.bittor.pw:6969/announce",
+    "udp://tracker.ducks.party:1984/announce",
+    "udp://retracker01-msk-virt.corbina.net:80/announce",
+    "http://tracker.dler.org:6969/announce",
+    "http://tracker.dler.com:6969/announce",
+    "udp://tracker2.dler.org:80/announce",
+    "udp://tracker.gmi.gd:6969/announce",
+    "http://tracker.renfei.net:8080/announce",
 ])
+
+# DHT bootstrap 节点（Mainline DHT 标准节点）
+DHT_NODES = [
+    "router.bittorrent.com:6881",
+    "router.utorrent.com:6881",
+    "dht.transmissionbt.com:6881",
+    "dht.libtorrent.org:25401",
+]
+
+
+def _dht_args() -> list[str]:
+    """aria2 的 DHT 入口点参数（可多个）。"""
+    args = []
+    for node in DHT_NODES:
+        args.append(f"--dht-entry-point={node}")
+    return args
 
 # ---------- 下载进度：rid -> {phase, total, downloaded, speed, file} ----------
 # phase: metadata / downloading / uploading
@@ -160,8 +192,7 @@ async def download_largest_video(magnet: str, dest_dir: str,
             f"--dir={meta_dir}", "--seed-time=0",
             "--bt-tracker-connect-timeout=15",
             f"--bt-tracker={TRACKERS}",
-            "--dht-entry-point=router.bittorrent.com:6881",
-            "--dht-entry-point6=router.bittorrent.com:6881",
+            *_dht_args(),
             magnet, timeout=config.META_TIMEOUT,
         )
         torrents = [f for f in os.listdir(meta_dir) if f.endswith(".torrent")]
@@ -186,6 +217,7 @@ async def download_largest_video(magnet: str, dest_dir: str,
         f"--select-file={file_idx}", f"--dir={dest_dir}",
         "--seed-time=0", "--bt-enable-lpd=true",
         f"--bt-tracker={TRACKERS}",
+        *_dht_args(),
         "--max-connection-per-server=8", "--split=8",
         magnet,
         stdin=asyncio.subprocess.DEVNULL,
