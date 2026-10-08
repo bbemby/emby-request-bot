@@ -268,7 +268,58 @@ def _find_request(arg: str) -> dict | None:
 # ---------- 求片通知文案 ----------
 def _user_mention(username: str, user_id: int) -> str:
     name = _esc(username or str(user_id))
-    return f'<a href="tg://user?id={user_id}">{name}</a>'
+    return f'<a href="tg://user?id={user_id}"><i>{name}</i></a>'
+
+
+async def send_report(app: Application, req: dict, title: str, title_emoji: str,
+                      status_line: str, cover_path: str | None = None) -> str:
+    """发送统一风格的报告（spoiler 封面 + caption）。
+    格式参考：
+        🎊 自动入库报告
+
+        🎬 番号：SONE-248
+        📽️ 资源：SONE-248 中文标题
+        👤 求片人：Wyatt
+        ✅ 状态：已存入媒体库，请刷新观看
+    返回 cover 的 TG file_id（供复用）。
+    """
+    code = _esc(req["code"])
+    title_cn = _esc(req.get("title_cn") or "")
+    resource = f"{code} {title_cn}".strip()
+    text = (
+        f"{title_emoji} {title}\n\n"
+        f"🎬 番号：{code}\n"
+        f"📽️ 资源：{resource}\n"
+        f"👤 求片人：{_user_mention(req['username'], req['user_id'])}\n"
+        f"{status_line}"
+    )
+    # 1) 优先用缓存的 cover_file_id
+    if req.get("cover_file_id"):
+        try:
+            await app.bot.send_photo(
+                chat_id=config.FEEDBACK_GROUP_ID, photo=req["cover_file_id"],
+                caption=text, parse_mode=ParseMode.HTML, has_spoiler=True)
+            return req["cover_file_id"]
+        except Exception as e:
+            log.warning("send report cached photo failed: %s", e)
+    # 2) 本地封面文件
+    if cover_path and os.path.isfile(cover_path):
+        try:
+            with open(cover_path, "rb") as f:
+                sent = await app.bot.send_photo(
+                    chat_id=config.FEEDBACK_GROUP_ID, photo=f,
+                    caption=text, parse_mode=ParseMode.HTML, has_spoiler=True)
+            return sent.photo[-1].file_id if sent.photo else ""
+        except Exception as e:
+            log.warning("send report photo failed: %s", e)
+    # 3) 无封面，纯文字
+    try:
+        await app.bot.send_message(
+            chat_id=config.FEEDBACK_GROUP_ID, text=text,
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception as e:
+        log.warning("send report text failed: %s", e)
+    return ""
 
 
 async def post_to_group(app: Application, text: str, cover_path: str | None = None,
@@ -369,14 +420,13 @@ async def handle_request(msg, code: str, user_id: int, username: str, app: Appli
     # 4) 入库
     rid = db.add_request(code, title_cn, user_id, username)
 
-    # 5) 封面 + 群通知
+    # 5) 封面 + 群通知（统一报告风格）
     cover = d.get("cover_url")
     cover_path = await _download_cover(code, cover) if cover else None
-    caption = f"📩 <b>新求片 #{rid}</b>\n👤 {_user_mention(username, user_id)}\n🎬 <b>{_esc(code)}</b>\n<i>{_esc(title_cn)}</i>"
-    text = (f"📩 <b>新求片 #{rid}</b>\n👤 {_user_mention(username, user_id)}\n"
-            f"🎬 <b>{_esc(code)}</b>\n<i>{_esc(title_cn)}</i>\n"
-            f"🕐 {time.strftime('%Y-%m-%d %H:%M')}")
-    file_id = await post_to_group(app, text, cover_path, caption)
+    req = {"id": rid, "code": code, "title_cn": title_cn,
+           "username": username, "user_id": user_id}
+    file_id = await send_report(app, req, f"求片报告 #{rid}", "📩",
+                                "⏳ 状态：排队等待下载", cover_path)
     if file_id:
         db.set_cover_file_id(rid, file_id)
     if cover_path:
@@ -715,9 +765,8 @@ async def _download_worker(app: Application, rid: int, magnets: list,
                 pass
 
     src = "🤖 自动" if auto else "🛠️ 管理员"
-    await post_to_group(
-        app, f"⬇️ <b>开始下载 #{rid}</b> {src}\n🎬 <code>{_esc(req['code'])}</code>\n"
-             f"共 {len(magnets)} 个磁力源，依次尝试…")
+    await send_report(app, req, f"下载报告 #{rid}", "⬇️",
+                      f"⬇️ 状态：正在下载…（{src}，共 {len(magnets)} 个磁力源）")
 
     local_path, info, ok_magnet = None, "", ""
     dest_dir = os.path.join(config.DOWNLOAD_DIR, req["code"])
@@ -746,10 +795,11 @@ async def _download_worker(app: Application, rid: int, magnets: list,
 
     if not local_path:
         db.update_status(rid, "pending", magnet="")
-        msg = (f"❌ <b>#{rid}</b> <code>{_esc(req['code'])}</code> 所有磁力都失败了\n"
-               f"已退回待处理，管理员可手动提供磁力。")
-        await post_to_group(app, msg)
-        await _notify_admin(msg)
+        await send_report(app, req, f"下载报告 #{rid}", "❌",
+                          "❌ 状态：所有磁力都失败，已退回待处理")
+        await _notify_admin(
+            f"❌ <b>#{rid}</b> <code>{_esc(req['code'])}</code> 所有磁力都失败了，"
+            f"已退回待处理。")
         return
 
     # 上传 Drive
@@ -766,19 +816,9 @@ async def _download_worker(app: Application, rid: int, magnets: list,
         return
     db.update_status(rid, "uploaded", drive_path=drive_info)
 
-    # 群通知（复用封面 file_id）
-    caption = (f"📥 <b>已上传待入库 #{rid}</b>\n👤 {_user_mention(req['username'], req['user_id'])}\n"
-               f"🎬 <b>{_esc(req['code'])}</b>\n<i>{_esc(req['title_cn'])}</i>")
-    if req.get("cover_file_id"):
-        try:
-            await app.bot.send_photo(chat_id=config.FEEDBACK_GROUP_ID,
-                                     photo=req["cover_file_id"], caption=caption,
-                                     parse_mode=ParseMode.HTML, has_spoiler=True)
-        except Exception as e:
-            log.warning("send group photo failed: %s", e)
-            await post_to_group(app, caption)
-    else:
-        await post_to_group(app, caption)
+    # 群通知（统一报告风格）
+    await send_report(app, req, f"上传报告 #{rid}", "📥",
+                      "📥 状态：已上传，等待入库")
     await _notify_admin(f"✅ #{rid} 处理完成：{_esc(drive_info)}")
 
 
@@ -859,18 +899,8 @@ async def check_library_once(app: Application):
         in_lib, lib_name = emby_client.is_in_library(r["code"])
         if in_lib:
             db.update_status(r["id"], "fulfilled")
-            caption = (f"✅ <b>已入库 #{r['id']}</b>\n👤 {_user_mention(r['username'], r['user_id'])}\n"
-                       f"🎬 <b>{_esc(r['code'])}</b>\n<i>{_esc(r['title_cn'])}</i>\n"
-                       f"📚 {_esc(lib_name[:60])}")
-            if r.get("cover_file_id"):
-                try:
-                    await app.bot.send_photo(
-                        chat_id=config.FEEDBACK_GROUP_ID, photo=r["cover_file_id"],
-                        caption=caption, parse_mode=ParseMode.HTML, has_spoiler=True)
-                    continue
-                except Exception:
-                    pass
-            await post_to_group(app, caption)
+            await send_report(app, r, "自动入库报告", "🎊",
+                              "✅ 状态：已存入媒体库，请刷新观看")
             log.info("request #%d fulfilled: %s", r["id"], r["code"])
         await asyncio.sleep(2)
 
