@@ -78,7 +78,7 @@ WantedBy=multi-user.target
 ## 🔧 实现细节
 
 - **求片去重**：同一番号未完结只保留一条；已在 Emby 的直接提示"已在库"
-- **选择性下载**：`aria2c --bt-metadata-only` 取元数据 → 纯 Python 解析 torrent → `--select-file` 只下最大视频（>50MB，广告文件自动跳过）
+- **选择性下载**：`aria2c --bt-metadata-only` 取元数据 → 纯 Python 解析 torrent → `--select-file` 只下最大视频（>50MB，广告文件自动跳过）。注意：BT piece 可能跨文件边界，小广告文件会作为 piece 一部分被顺带下载，下载完成后会自动清理只保留主视频
 - **封面**：JavDB 图床图片加密，用 `javdb assets download` 解密后 `has_spoiler=True` 发送；TG file_id 缓存复用
 - **入库检查**：`GET /emby/Items?SearchTerm=<番号>`，标题命中才算数
 - **数据**：SQLite 单文件，求片状态机 pending → downloading → uploaded → fulfilled
