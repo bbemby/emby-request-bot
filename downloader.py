@@ -268,4 +268,25 @@ async def download_largest_video(magnet: str, dest_dir: str,
             found = cands[0][1]
     if not found:
         return None, "下载完成但找不到视频文件"
+
+    # 清理：只保留选中的视频文件
+    # （BT piece 可能跨文件边界，小广告文件会作为 piece 一部分被顺带下载，select-file 防不住）
+    for root, _, files in os.walk(dest_dir):
+        for fn in files:
+            p = os.path.join(root, fn)
+            if p == found or fn.endswith(".aria2"):
+                continue
+            try:
+                os.remove(p)
+                log.info("removed junk file: %s", fn[:60])
+            except OSError:
+                pass
+    # 删空目录
+    for root, dirs, files in os.walk(dest_dir, topdown=False):
+        if not dirs and not files and root != dest_dir:
+            try:
+                os.rmdir(root)
+            except OSError:
+                pass
+
     return found, f"{file_name} ({file_size / 1e9:.1f}GB)"
