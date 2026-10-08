@@ -27,6 +27,9 @@ import time
 import urllib.request
 
 from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
@@ -612,6 +615,24 @@ async def check_library_loop(app: Application):
 
 
 async def _post_init(app: Application):
+    # 左下角命令菜单：默认用户 + 管理员专属
+    user_cmds = [
+        BotCommand("start", "开始使用"),
+        BotCommand("help", "帮助说明"),
+        BotCommand("s", "搜番：简介/封面/磁力"),
+        BotCommand("q", "求片"),
+    ]
+    admin_cmds = user_cmds + [
+        BotCommand("pending", "查看未完结求片"),
+        BotCommand("cancel", "取消求片"),
+        BotCommand("done", "手动标记入库"),
+    ]
+    try:
+        await app.bot.set_my_commands(user_cmds, scope=BotCommandScopeDefault())
+        for admin_id in config.ADMIN_IDS:
+            await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(admin_id))
+    except Exception as e:
+        log.warning("set commands failed: %s", e)
     asyncio.create_task(check_library_loop(app))
 
 
