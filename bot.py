@@ -482,7 +482,12 @@ async def cmd_progress(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         p = downloader.get_progress(r["id"])
         head = f"\n#{r['id']} <code>{_esc(r['code'])}</code>"
         if not p:
-            lines.append(f"{head} — {r['status']}…")
+            # 没有进度数据：可能是任务刚启动，或僵尸任务（自愈）
+            if r["id"] not in _download_tasks:
+                db.update_status(r["id"], "pending")
+                lines.append(f"{head} — ⚠️ 任务已失效，退回待处理")
+            else:
+                lines.append(f"{head} — ⏳ 准备中…")
             continue
         # 已耗时
         elapsed = ""
@@ -745,6 +750,12 @@ async def check_library_loop(app: Application):
 
 
 async def _post_init(app: Application):
+    # 启动时恢复：上次异常中断的 downloading/uploading 重置为 pending
+    #（重启后内存中的任务和进度都丢了，DB 状态会变成僵尸）
+    for r in db.list_by_status(("downloading", "uploading")):
+        db.update_status(r["id"], "pending")
+        log.info("reset stale %s #%d to pending", r["code"], r["id"])
+
     # 左下角命令菜单：默认用户 + 管理员专属
     user_cmds = [
         BotCommand("start", "开始使用"),
