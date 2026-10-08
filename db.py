@@ -1,4 +1,5 @@
 """SQLite 求片记录。"""
+import datetime
 import logging
 import sqlite3
 import time
@@ -92,3 +93,42 @@ def update_status(rid: int, status: str, **fields):
 def set_cover_file_id(rid: int, file_id: str):
     with _conn() as c:
         c.execute("UPDATE requests SET cover_file_id = ? WHERE id = ?", (file_id, rid))
+
+
+def _day_start() -> float:
+    return time.mktime(datetime.date.today().timetuple())
+
+
+def count_user_today(user_id: int) -> int:
+    """用户今天求了几部（含已取消，防刷）。"""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT COUNT(*) FROM requests WHERE user_id = ? AND created_at >= ?",
+            (user_id, _day_start())).fetchone()
+        return row[0] if row else 0
+
+
+def get_user_requests(user_id: int, limit: int = 10) -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM requests WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_stats() -> dict:
+    with _conn() as c:
+        total = c.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+        by_status = {r[0]: r[1] for r in c.execute(
+            "SELECT status, COUNT(*) FROM requests GROUP BY status")}
+        today = c.execute(
+            "SELECT COUNT(*) FROM requests WHERE created_at >= ?",
+            (_day_start(),)).fetchone()[0]
+        week = c.execute(
+            "SELECT COUNT(*) FROM requests WHERE created_at >= ?",
+            (_day_start() - 6 * 86400,)).fetchone()[0]
+        top = c.execute(
+            "SELECT code, COUNT(*) as n FROM requests "
+            "GROUP BY code ORDER BY n DESC LIMIT 5").fetchall()
+        return {"total": total, "by_status": by_status, "today": today,
+                "week": week, "top": [(r[0], r[1]) for r in top]}

@@ -31,6 +31,13 @@ class Config:
     # 调度
     CHECK_INTERVAL_MIN: int = int(_get("CHECK_INTERVAL_MIN", "30") or 30)
 
+    # 每人每天求片上限（0=不限）
+    DAILY_LIMIT: int = int(_get("DAILY_LIMIT", "5") or 5)
+
+    # Emby webhook 接收端口（Emby装webhook插件后POST到 http://服务器:端口/emby-webhook）
+    WEBHOOK_PORT: int = int(_get("WEBHOOK_PORT", "8080") or 8080)
+    WEBHOOK_TOKEN: str = _get("WEBHOOK_TOKEN", "")  # 可选，?token=xxx 校验
+
     # 求片后自动下载（中文优先的最优磁力），默认开
     AUTO_DOWNLOAD: bool = _get("AUTO_DOWNLOAD", "true").lower() not in ("0", "false", "no")
 

@@ -55,6 +55,11 @@ import javdb_client as jdb
 from config import config
 from translator import translate
 
+try:
+    from aiohttp import web
+except ImportError:
+    web = None
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
@@ -62,6 +67,11 @@ log = logging.getLogger("emby_request_bot")
 
 CODE_RE = re.compile(r"^[A-Z0-9]+-[0-9]+$", re.I)
 MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:[a-zA-Z0-9]+", re.I)
+
+STATUS_EMOJI = {
+    "pending": "⏳", "downloading": "⬇️", "uploading": "📤",
+    "uploaded": "📥", "fulfilled": "✅", "failed": "❌", "cancelled": "🚫",
+}
 
 _cache: dict[str, tuple[float, dict]] = {}
 _last_query: dict[int, float] = {}
@@ -308,9 +318,23 @@ async def handle_request(msg, code: str, user_id: int, username: str, app: Appli
     dup = db.find_active_by_code(code)
     if dup:
         rid = dup["id"]
+        # 正在下载 → 显示实时进度
+        if rid in _download_tasks:
+            p = downloader.get_progress(rid)
+            if p and p.get("total"):
+                pct = min(100.0, p["downloaded"] / p["total"] * 100)
+                bar = "█" * int(pct // 10) + "░" * (10 - int(pct // 10))
+                await thinking.edit_text(
+                    f"📮 <code>{_esc(code)}</code> 正在下载中（#{rid}）\n"
+                    f"[{bar}] {pct:.0f}% · {p['speed'] / 1024 / 1024:.1f}MB/s",
+                    parse_mode=ParseMode.HTML)
+            else:
+                await thinking.edit_text(
+                    f"📮 <code>{_esc(code)}</code> 正在下载中（#{rid}）…",
+                    parse_mode=ParseMode.HTML)
+            return
         # pending 但没有下载任务在跑 → 自动重新触发（比如重启后被重置的）
-        if (dup["status"] == "pending" and rid not in _download_tasks
-                and config.AUTO_DOWNLOAD):
+        if (dup["status"] == "pending" and config.AUTO_DOWNLOAD):
             result = await fetch_movie(code)
             magnets = (result or {}).get("magnets") or []
             if magnets:
@@ -323,6 +347,15 @@ async def handle_request(msg, code: str, user_id: int, username: str, app: Appli
             f"📮 <code>{_esc(code)}</code> 已经有人求过了（#{rid}），排队中…",
             parse_mode=ParseMode.HTML)
         return
+
+    # 2.5) 每日求片上限（防刷）
+    if config.DAILY_LIMIT > 0:
+        n = db.count_user_today(user_id)
+        if n >= config.DAILY_LIMIT:
+            await thinking.edit_text(
+                f"🚫 你今天求片已达上限（{config.DAILY_LIMIT}部/天），明天再来吧！",
+                parse_mode=ParseMode.HTML)
+            return
 
     # 3) 取影片信息
     result = await fetch_movie(code)
@@ -368,6 +401,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "👋 <b>Emby 求片 Bot</b>\n\n"
         "<code>/s 番号</code> — 搜番看简介/封面/磁力\n"
         "<code>/q 番号</code> — 求片（私聊直接发番号也行）\n"
+        "<code>/my</code> — 我的求片\n"
         "📷 私聊发图 — 以图搜番\n\n"
         "求片后入库会自动通知！",
         parse_mode=ParseMode.HTML)
@@ -379,7 +413,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "<b>用户</b>\n"
             "/s <code>番号</code> — 搜番\n"
             "/q <code>番号</code> — 求片\n"
-            "私聊发番号 / 发图 — 求片 / 以图搜番\n\n")
+            "私聊发番号 / 发图 — 求片 / 以图搜番\n"
+            "/my — 我的求片记录\n\n")
     if is_adm:
         text += ("<b>管理员</b>\n"
                  "/pending — 未完结求片\n"
@@ -387,7 +422,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  "/retry <code>id或番号</code> — 重试下载\n"
                  "私聊发磁力链接 — 选求片下载（可覆盖自动下载）\n"
                  "/cancel <code>id或番号</code> — 取消求片\n"
-                 "/done <code>id</code> — 手动标记入库\n")
+                 "/done <code>id</code> — 手动标记入库\n"
+                 "/stats — 求片统计\n")
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
@@ -533,6 +569,49 @@ async def cmd_progress(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(
             f"{head}\n[{bar}] {pct:.0f}%\n"
             f"{p['downloaded'] / 1e9:.2f}GB / {total / 1e9:.2f}GB · {speed:.1f}MB/s")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_my(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """用户查看自己的求片记录和状态。"""
+    rows = db.get_user_requests(update.effective_user.id)
+    if not rows:
+        await update.message.reply_text("📭 你还没有求过片。")
+        return
+    lines = ["📋 <b>我的求片</b>"]
+    for r in rows:
+        emoji = STATUS_EMOJI.get(r["status"], "•")
+        line = f"\n#{r['id']} <code>{_esc(r['code'])}</code> {emoji}"
+        if r["id"] in _download_tasks:
+            p = downloader.get_progress(r["id"])
+            if p and p.get("total"):
+                pct = min(100.0, p["downloaded"] / p["total"] * 100)
+                line += f" {pct:.0f}%"
+            else:
+                line += " 下载中…"
+        else:
+            line += f" {_esc(r['status'])}"
+        if r.get("title_cn"):
+            line += f"\n<i>{_esc(r['title_cn'][:40])}</i>"
+        lines.append(line)
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """管理员查看求片统计。"""
+    if not is_admin(update.effective_user.id):
+        return
+    s = db.get_stats()
+    lines = ["📊 <b>求片统计</b>",
+             f"\n总求片：{s['total']}｜今日：{s['today']}｜近7天：{s['week']}"]
+    if s["by_status"]:
+        lines.append("\n<b>状态分布</b>")
+        for st, n in sorted(s["by_status"].items(), key=lambda x: -x[1]):
+            lines.append(f"{STATUS_EMOJI.get(st, '•')} {st}: {n}")
+    if s["top"]:
+        lines.append("\n<b>热门番号</b>")
+        for code, n in s["top"]:
+            lines.append(f"<code>{_esc(code)}</code> ×{n}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -773,32 +852,68 @@ async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- 定时检查入库 ----------
+async def check_library_once(app: Application):
+    """检查一次入库，有入库的发群通知（定时任务和 webhook 共用）。"""
+    rows = db.list_by_status()
+    for r in rows:
+        in_lib, lib_name = emby_client.is_in_library(r["code"])
+        if in_lib:
+            db.update_status(r["id"], "fulfilled")
+            caption = (f"✅ <b>已入库 #{r['id']}</b>\n👤 {_user_mention(r['username'], r['user_id'])}\n"
+                       f"🎬 <b>{_esc(r['code'])}</b>\n<i>{_esc(r['title_cn'])}</i>\n"
+                       f"📚 {_esc(lib_name[:60])}")
+            if r.get("cover_file_id"):
+                try:
+                    await app.bot.send_photo(
+                        chat_id=config.FEEDBACK_GROUP_ID, photo=r["cover_file_id"],
+                        caption=caption, parse_mode=ParseMode.HTML, has_spoiler=True)
+                    continue
+                except Exception:
+                    pass
+            await post_to_group(app, caption)
+            log.info("request #%d fulfilled: %s", r["id"], r["code"])
+        await asyncio.sleep(2)
+
+
 async def check_library_loop(app: Application):
     await asyncio.sleep(60)  # 启动后等 1 分钟再开始
     while True:
         try:
-            rows = db.list_by_status()
-            for r in rows:
-                in_lib, lib_name = emby_client.is_in_library(r["code"])
-                if in_lib:
-                    db.update_status(r["id"], "fulfilled")
-                    caption = (f"✅ <b>已入库 #{r['id']}</b>\n👤 {_user_mention(r['username'], r['user_id'])}\n"
-                               f"🎬 <b>{_esc(r['code'])}</b>\n<i>{_esc(r['title_cn'])}</i>\n"
-                               f"📚 {_esc(lib_name[:60])}")
-                    if r.get("cover_file_id"):
-                        try:
-                            await app.bot.send_photo(
-                                chat_id=config.FEEDBACK_GROUP_ID, photo=r["cover_file_id"],
-                                caption=caption, parse_mode=ParseMode.HTML, has_spoiler=True)
-                            continue
-                        except Exception:
-                            pass
-                    await post_to_group(app, caption)
-                    log.info("request #%d fulfilled: %s", r["id"], r["code"])
-                await asyncio.sleep(2)
+            await check_library_once(app)
         except Exception:
             log.exception("check loop error")
         await asyncio.sleep(config.CHECK_INTERVAL_MIN * 60)
+
+
+# ---------- Emby webhook（即时入库通知） ----------
+async def _emby_webhook_handler(request):
+    """Emby webhook 插件 POST 到这里，library.new 时立即检查入库。"""
+    bot_app = request.app["bot_app"]
+    if config.WEBHOOK_TOKEN:
+        if request.query.get("token", "") != config.WEBHOOK_TOKEN:
+            return web.Response(status=403, text="forbidden")
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    event = str(data.get("Event") or data.get("event") or "")
+    log.info("emby webhook event: %s", event)
+    if "library" in event.lower() or not event:
+        asyncio.create_task(check_library_once(bot_app))
+    return web.Response(text="ok")
+
+
+async def _start_webhook_server(bot_app: Application):
+    if web is None:
+        log.warning("aiohttp not installed, emby webhook disabled")
+        return
+    aapp = web.Application()
+    aapp["bot_app"] = bot_app
+    aapp.router.add_post("/emby-webhook", _emby_webhook_handler)
+    runner = web.AppRunner(aapp)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", config.WEBHOOK_PORT).start()
+    log.info("emby webhook listening on :%d/emby-webhook", config.WEBHOOK_PORT)
 
 
 async def _post_init(app: Application):
@@ -814,6 +929,7 @@ async def _post_init(app: Application):
         BotCommand("help", "帮助说明"),
         BotCommand("s", "搜番：简介/封面/磁力"),
         BotCommand("q", "求片"),
+        BotCommand("my", "我的求片"),
     ]
     admin_cmds = user_cmds + [
         BotCommand("pending", "查看未完结求片"),
@@ -821,6 +937,7 @@ async def _post_init(app: Application):
         BotCommand("retry", "重试下载（id或番号）"),
         BotCommand("cancel", "取消求片（id或番号）"),
         BotCommand("done", "手动标记入库"),
+        BotCommand("stats", "求片统计"),
     ]
     try:
         await app.bot.set_my_commands(user_cmds, scope=BotCommandScopeDefault())
@@ -829,6 +946,7 @@ async def _post_init(app: Application):
     except Exception as e:
         log.warning("set commands failed: %s", e)
     asyncio.create_task(check_library_loop(app))
+    asyncio.create_task(_start_webhook_server(app))
 
 
 def main():
@@ -841,11 +959,13 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("s", cmd_search))
     app.add_handler(CommandHandler("q", cmd_request))
+    app.add_handler(CommandHandler("my", cmd_my))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("progress", cmd_progress))
     app.add_handler(CommandHandler("retry", cmd_retry))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("done", cmd_done))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CallbackQueryHandler(dl_pick, pattern=r"^dl:"))
     app.add_handler(CallbackQueryHandler(pick_candidate, pattern=r"^pick:"))
     app.add_handler(MessageHandler(filters.PHOTO, photo_search))
