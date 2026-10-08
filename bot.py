@@ -242,6 +242,19 @@ async def send_result(msg, code: str):
                          disable_web_page_preview=True)
 
 
+def _find_request(arg: str) -> dict | None:
+    """按 id 或番号找未完结求片。"""
+    arg = arg.strip().upper()
+    req = None
+    if arg.isdigit():
+        req = db.get_request(int(arg))
+        if req and req["status"] not in db.ACTIVE_STATUSES:
+            req = None
+    if not req:
+        req = db.find_active_by_code(arg)
+    return req
+
+
 # ---------- 求片通知文案 ----------
 def _user_mention(username: str, user_id: int) -> str:
     name = _esc(username or str(user_id))
@@ -294,8 +307,20 @@ async def handle_request(msg, code: str, user_id: int, username: str, app: Appli
     # 2) 已有人求过？
     dup = db.find_active_by_code(code)
     if dup:
+        rid = dup["id"]
+        # pending 但没有下载任务在跑 → 自动重新触发（比如重启后被重置的）
+        if (dup["status"] == "pending" and rid not in _download_tasks
+                and config.AUTO_DOWNLOAD):
+            result = await fetch_movie(code)
+            magnets = (result or {}).get("magnets") or []
+            if magnets:
+                await thinking.edit_text(
+                    f"📮 <code>{_esc(code)}</code> 已在队列（#{rid}），重新开始下载…",
+                    parse_mode=ParseMode.HTML)
+                start_download(app, rid, magnets, auto=True)
+                return
         await thinking.edit_text(
-            f"📮 <code>{_esc(code)}</code> 已经有人求过了（#{dup['id']}），排队中…",
+            f"📮 <code>{_esc(code)}</code> 已经有人求过了（#{rid}），排队中…",
             parse_mode=ParseMode.HTML)
         return
 
@@ -359,6 +384,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text += ("<b>管理员</b>\n"
                  "/pending — 未完结求片\n"
                  "/progress — 下载进度\n"
+                 "/retry <code>id或番号</code> — 重试下载\n"
                  "私聊发磁力链接 — 选求片下载（可覆盖自动下载）\n"
                  "/cancel <code>id或番号</code> — 取消求片\n"
                  "/done <code>id</code> — 手动标记入库\n")
@@ -683,12 +709,7 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("用法：<code>/cancel id或番号</code>",
                                         parse_mode=ParseMode.HTML)
         return
-    arg = ctx.args[0].strip().upper()
-    req = None
-    if arg.isdigit():
-        req = db.get_request(int(arg))
-    if not req:
-        req = db.find_active_by_code(arg)
+    req = _find_request(ctx.args[0])
     if not req:
         await update.message.reply_text(f"❌ 没找到 { _esc(ctx.args[0]) } 的未完结求片。",
                                         parse_mode=ParseMode.HTML)
@@ -702,6 +723,37 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     downloader.clear_progress(rid)
     await update.message.reply_text(
         f"🚫 #{rid} <code>{_esc(req['code'])}</code> 已取消。",
+        parse_mode=ParseMode.HTML)
+
+
+async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """管理员重试：/retry <id或番号>，重新触发自动下载。"""
+    if not is_admin(update.effective_user.id) or not ctx.args:
+        await update.message.reply_text("用法：<code>/retry id或番号</code>",
+                                        parse_mode=ParseMode.HTML)
+        return
+    req = _find_request(ctx.args[0])
+    if not req or req["status"] not in ("pending", "failed"):
+        await update.message.reply_text("❌ 没找到可重试的求片（仅 pending/failed 可重试）。",
+                                        parse_mode=ParseMode.HTML)
+        return
+    rid = req["id"]
+    if rid in _download_tasks:
+        await update.message.reply_text(f"⏳ #{rid} 正在下载中，无需重试。",
+                                        parse_mode=ParseMode.HTML)
+        return
+    thinking = await update.message.reply_text(f"🔍 正在找 <code>{_esc(req['code'])}</code> 的磁力…",
+                                               parse_mode=ParseMode.HTML)
+    result = await fetch_movie(req["code"])
+    magnets = (result or {}).get("magnets") or []
+    if not magnets:
+        await thinking.edit_text(f"❌ #{rid} 暂无磁力源。", parse_mode=ParseMode.HTML)
+        return
+    await thinking.delete()
+    start_download(ctx.application, rid, magnets, auto=True,
+                   notify_chat_id=update.effective_chat.id)
+    await update.message.reply_text(
+        f"🔄 #{rid} <code>{_esc(req['code'])}</code> 已重新开始下载。",
         parse_mode=ParseMode.HTML)
 
 
@@ -766,6 +818,7 @@ async def _post_init(app: Application):
     admin_cmds = user_cmds + [
         BotCommand("pending", "查看未完结求片"),
         BotCommand("progress", "查看下载进度"),
+        BotCommand("retry", "重试下载（id或番号）"),
         BotCommand("cancel", "取消求片（id或番号）"),
         BotCommand("done", "手动标记入库"),
     ]
@@ -790,6 +843,7 @@ def main():
     app.add_handler(CommandHandler("q", cmd_request))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("progress", cmd_progress))
+    app.add_handler(CommandHandler("retry", cmd_retry))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CallbackQueryHandler(dl_pick, pattern=r"^dl:"))
