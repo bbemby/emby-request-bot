@@ -328,14 +328,10 @@ async def handle_request(msg, code: str, user_id: int, username: str, app: Appli
         f"📩 求片 <code>{_esc(code)}</code> 已登记（#{rid}），入库后会通知你！",
         parse_mode=ParseMode.HTML)
 
-    # 6) 自动下载：取最优磁力（中字优先）直接开下
+    # 6) 自动下载：依次尝试最优磁力（中字优先）
     magnets = result["magnets"]
     if config.AUTO_DOWNLOAD and magnets:
-        best = magnets[0]
-        cnsub = "中字" if best.get("cnsub") else "无字幕"
-        start_download(
-            app, rid, jdb.magnet_link(best), auto=True,
-            magnet_label=f"{best.get('name') or ''} [{cnsub}·{jdb.format_size(best.get('size'))}]")
+        start_download(app, rid, magnets, auto=True)
     elif not magnets:
         await post_to_group(
             app, f"⏳ <b>#{rid}</b> <code>{_esc(code)}</code> 暂无磁力源，等待管理员手动提供磁力。")
@@ -364,7 +360,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  "/pending — 未完结求片\n"
                  "/progress — 下载进度\n"
                  "私聊发磁力链接 — 选求片下载（可覆盖自动下载）\n"
-                 "/cancel <code>id</code> — 取消求片\n"
+                 "/cancel <code>id或番号</code> — 取消求片\n"
                  "/done <code>id</code> — 手动标记入库\n")
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -488,11 +484,16 @@ async def cmd_progress(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not p:
             lines.append(f"{head} — {r['status']}…")
             continue
+        # 已耗时
+        elapsed = ""
+        if p.get("started"):
+            mins = int((time.time() - p["started"]) / 60)
+            elapsed = f" · 已用{mins}分钟" if mins else " · 刚开始"
         if p["phase"] == "uploading":
-            lines.append(f"{head} — 📤 上传 Drive 中…")
+            lines.append(f"{head} — 📤 上传 Drive 中…{elapsed}")
             continue
         if p["phase"] == "metadata":
-            lines.append(f"{head} — 🔍 获取种子元数据…")
+            lines.append(f"{head} — 🔍 获取种子元数据…{elapsed}")
             continue
         total = p["total"] or 1
         pct = min(100.0, p["downloaded"] / total * 100)
@@ -557,48 +558,43 @@ async def dl_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         f"⬇️ 开始下载 <code>{_esc(req['code'])}</code>（#{rid}）…\n只下最大视频文件，稍候。",
         parse_mode=ParseMode.HTML)
-    start_download(ctx.application, rid, magnet,
+    start_download(ctx.application, rid, [{"magnet": magnet, "label": "管理员手动提供"}],
                    notify_chat_id=query.message.chat_id, auto=False)
 
 
-def start_download(app: Application, rid: int, magnet: str,
+def start_download(app: Application, rid: int, magnets: list,
                    notify_chat_id: int | None = None,
-                   auto: bool = False, magnet_label: str = ""):
-    """启动下载任务；已有任务会被取消并替换。"""
+                   auto: bool = False):
+    """启动下载任务；已有任务会被取消并替换。
+
+    magnets: 磁力 dict 列表（已按中字优先/体积排序），依次尝试直到成功。
+    手动单磁力传 [{"magnet": magnet, "label": "..."}]。
+    """
     old = _download_tasks.pop(rid, None)
     if old and not old.done():
         old.cancel()
     task = asyncio.create_task(
-        _download_worker(app, rid, magnet, notify_chat_id, auto, magnet_label))
+        _download_worker(app, rid, magnets, notify_chat_id, auto))
     _download_tasks[rid] = task
     task.add_done_callback(lambda t: _download_tasks.pop(rid, None))
     return task
 
 
-async def _download_worker(app: Application, rid: int, magnet: str,
-                           notify_chat_id: int | None,
-                           auto: bool, magnet_label: str):
-    """下载 → 传 Drive → 群通知，全流程后台任务。"""
+def _magnet_info(m: dict) -> tuple[str, str]:
+    """从磁力 dict 取 (magnet链接, 显示标签)。"""
+    if "magnet" in m:  # 手动单磁力
+        return m["magnet"], m.get("label", "")
+    link = jdb.magnet_link(m)
+    cnsub = "中字" if m.get("cnsub") else "无字幕"
+    return link, f"{m.get('name') or ''} [{cnsub}·{jdb.format_size(m.get('size'))}]"
+
+
+async def _download_worker(app: Application, rid: int, magnets: list,
+                           notify_chat_id: int | None, auto: bool):
+    """下载 → 传 Drive → 群通知，全流程后台任务。多磁力依次重试。"""
     req = db.get_request(rid)
-    if not req:
+    if not req or not magnets:
         return
-    db.update_status(rid, "downloading", magnet=magnet)
-
-    src = "🤖 自动" if auto else "🛠️ 管理员"
-    label = f"\n🧲 {_esc(magnet_label[:80])}" if magnet_label else ""
-    kickoff = (f"⬇️ <b>开始下载 #{rid}</b> {src}\n"
-               f"🎬 <code>{_esc(req['code'])}</code>{label}")
-    await post_to_group(app, kickoff)
-
-    dest_dir = os.path.join(config.DOWNLOAD_DIR, req["code"])
-    try:
-        local_path, info = await downloader.download_largest_video(magnet, dest_dir, rid=rid)
-    except asyncio.CancelledError:
-        db.update_status(rid, "pending", magnet="")
-        downloader.clear_progress(rid)
-        await post_to_group(app, f"🔄 <b>#{rid}</b> 下载被新的磁力替换。")
-        raise
-    downloader.clear_progress(rid)
 
     async def _notify_admin(text: str):
         if notify_chat_id:
@@ -608,16 +604,46 @@ async def _download_worker(app: Application, rid: int, magnet: str,
             except Exception:
                 pass
 
+    src = "🤖 自动" if auto else "🛠️ 管理员"
+    await post_to_group(
+        app, f"⬇️ <b>开始下载 #{rid}</b> {src}\n🎬 <code>{_esc(req['code'])}</code>\n"
+             f"共 {len(magnets)} 个磁力源，依次尝试…")
+
+    local_path, info, ok_magnet = None, "", ""
+    dest_dir = os.path.join(config.DOWNLOAD_DIR, req["code"])
+    for i, m in enumerate(magnets):
+        magnet, label = _magnet_info(m)
+        if not magnet:
+            continue
+        db.update_status(rid, "downloading", magnet=magnet)
+        log.info("#%d trying magnet %d/%d: %s", rid, i + 1, len(magnets), label[:60])
+        try:
+            local_path, info = await downloader.download_largest_video(magnet, dest_dir, rid=rid)
+        except asyncio.CancelledError:
+            db.update_status(rid, "pending", magnet="")
+            downloader.clear_progress(rid)
+            await post_to_group(app, f"🔄 <b>#{rid}</b> 下载被新的磁力替换。")
+            raise
+        downloader.clear_progress(rid)
+        if local_path:
+            ok_magnet = magnet
+            break
+        # 这个磁力失败，试下一个
+        msg = (f"⚠️ <b>#{rid}</b> 磁力 {i + 1}/{len(magnets)} 失败：{_esc(info[:100])}\n"
+               f"尝试下一个…")
+        await post_to_group(app, msg)
+        await _notify_admin(msg)
+
     if not local_path:
         db.update_status(rid, "pending", magnet="")
-        msg = (f"❌ <b>#{rid}</b> <code>{_esc(req['code'])}</code> 下载失败：{_esc(info)}\n"
+        msg = (f"❌ <b>#{rid}</b> <code>{_esc(req['code'])}</code> 所有磁力都失败了\n"
                f"已退回待处理，管理员可手动提供磁力。")
         await post_to_group(app, msg)
         await _notify_admin(msg)
         return
 
     # 上传 Drive
-    db.update_status(rid, "uploading")
+    db.update_status(rid, "uploading", magnet=ok_magnet)
     downloader.set_phase(rid, "uploading")
     await _notify_admin(f"📤 <b>#{rid}</b> 下载完成，正在上传 Drive…\n{_esc(info)}")
     ok, drive_info = await drive.upload_to_drive(local_path)
@@ -647,23 +673,31 @@ async def _download_worker(app: Application, rid: int, magnet: str,
 
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """管理员取消求片：/cancel <id或番号>。"""
     if not is_admin(update.effective_user.id) or not ctx.args:
+        await update.message.reply_text("用法：<code>/cancel id或番号</code>",
+                                        parse_mode=ParseMode.HTML)
         return
-    try:
-        rid = int(ctx.args[0])
-    except ValueError:
-        return
-    req = db.get_request(rid)
+    arg = ctx.args[0].strip().upper()
+    req = None
+    if arg.isdigit():
+        req = db.get_request(int(arg))
     if not req:
-        await update.message.reply_text("❌ 没有这个求片。")
+        req = db.find_active_by_code(arg)
+    if not req:
+        await update.message.reply_text(f"❌ 没找到 { _esc(ctx.args[0]) } 的未完结求片。",
+                                        parse_mode=ParseMode.HTML)
         return
+    rid = req["id"]
     db.update_status(rid, "cancelled")
     # 取消进行中的下载任务
     task = _download_tasks.pop(rid, None)
     if task and not task.done():
         task.cancel()
     downloader.clear_progress(rid)
-    await update.message.reply_text(f"🚫 #{rid} 已取消。")
+    await update.message.reply_text(
+        f"🚫 #{rid} <code>{_esc(req['code'])}</code> 已取消。",
+        parse_mode=ParseMode.HTML)
 
 
 async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -721,7 +755,7 @@ async def _post_init(app: Application):
     admin_cmds = user_cmds + [
         BotCommand("pending", "查看未完结求片"),
         BotCommand("progress", "查看下载进度"),
-        BotCommand("cancel", "取消求片"),
+        BotCommand("cancel", "取消求片（id或番号）"),
         BotCommand("done", "手动标记入库"),
     ]
     try:

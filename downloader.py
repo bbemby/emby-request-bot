@@ -18,6 +18,15 @@ log = logging.getLogger(__name__)
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m2ts", ".ts", ".mpg"}
 
+# 公开 tracker，帮助 DHT 更快找到 peer（元数据阶段很关键）
+TRACKERS = ",".join([
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://explodie.org:6969/announce",
+    "udp://tracker.bittor.pw:6969/announce",
+])
+
 # ---------- 下载进度：rid -> {phase, total, downloaded, speed, file} ----------
 # phase: metadata / downloading / uploading
 _progress: dict[int, dict] = {}
@@ -141,7 +150,7 @@ async def download_largest_video(magnet: str, dest_dir: str,
     os.makedirs(dest_dir, exist_ok=True)
     if rid is not None:
         _progress[rid] = {"phase": "metadata", "total": 0, "downloaded": 0,
-                          "speed": 0, "file": ""}
+                          "speed": 0, "file": "", "started": time.time()}
 
     # 1) 取元数据
     meta_dir = tempfile.mkdtemp(prefix="meta_")
@@ -149,8 +158,11 @@ async def download_largest_video(magnet: str, dest_dir: str,
         rc, log_tail = await _run_aria2(
             "--bt-metadata-only=true", "--bt-save-metadata=true",
             f"--dir={meta_dir}", "--seed-time=0",
-            "--bt-tracker-connect-timeout=20",
-            magnet, timeout=180,
+            "--bt-tracker-connect-timeout=15",
+            f"--bt-tracker={TRACKERS}",
+            "--dht-entry-point=router.bittorrent.com:6881",
+            "--dht-entry-point6=router.bittorrent.com:6881",
+            magnet, timeout=config.META_TIMEOUT,
         )
         torrents = [f for f in os.listdir(meta_dir) if f.endswith(".torrent")]
         if not torrents:
@@ -165,13 +177,15 @@ async def download_largest_video(magnet: str, dest_dir: str,
     log.info("selected file #%d %s (%.1fGB)", file_idx, file_name, file_size / 1e9)
     if rid is not None:
         _progress[rid] = {"phase": "downloading", "total": file_size,
-                          "downloaded": 0, "speed": 0, "file": file_name}
+                          "downloaded": 0, "speed": 0, "file": file_name,
+                          "started": _progress.get(rid, {}).get("started", time.time())}
 
     # 2) 只下载选中的文件（轮询进度）
     proc = await asyncio.create_subprocess_exec(
         config.ARIA2_BIN,
         f"--select-file={file_idx}", f"--dir={dest_dir}",
         "--seed-time=0", "--bt-enable-lpd=true",
+        f"--bt-tracker={TRACKERS}",
         "--max-connection-per-server=8", "--split=8",
         magnet,
         stdin=asyncio.subprocess.DEVNULL,

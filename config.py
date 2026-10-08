@@ -34,6 +34,9 @@ class Config:
     # 求片后自动下载（中文优先的最优磁力），默认开
     AUTO_DOWNLOAD: bool = _get("AUTO_DOWNLOAD", "true").lower() not in ("0", "false", "no")
 
+    # 磁力元数据获取超时（秒），超时换下一个磁力重试
+    META_TIMEOUT: int = int(_get("META_TIMEOUT", "120") or 120)
+
     # 搜番相关（复用 javdb-ss 逻辑）
     MAGNET_COUNT: int = int(_get("MAGNET_COUNT", "3") or 3)
     RATE_LIMIT_SECONDS: int = int(_get("RATE_LIMIT_SECONDS", "3") or 3)
