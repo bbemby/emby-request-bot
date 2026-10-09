@@ -48,8 +48,9 @@ from telegram.ext import (
 )
 
 import db
-import downloader
-import drive
+import downloader  # 旧 aria2 流程，已停用（保留兼容）
+import drive  # 旧 Drive 上传，已停用（保留兼容）
+import pikpak_client
 import emby_client
 import javdb_client as jdb
 from config import config
@@ -71,6 +72,7 @@ MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:[a-zA-Z0-9]+", re.I)
 STATUS_EMOJI = {
     "pending": "⏳", "downloading": "⬇️", "uploading": "📤",
     "uploaded": "📥", "fulfilled": "✅", "failed": "❌", "cancelled": "🚫",
+    "pikpak_queued": "☁️", "pikpak_done": "✅",
 }
 
 _cache: dict[str, tuple[float, dict]] = {}
@@ -369,20 +371,21 @@ async def handle_request(msg, code: str, user_id: int, username: str, app: Appli
     dup = db.find_active_by_code(code)
     if dup:
         rid = dup["id"]
-        # 正在下载 → 显示实时进度
+        # PikPak 离线中 → 显示 PikPak 进度
+        if dup["status"] == "pikpak_queued" and dup.get("pikpak_task_id"):
+            import asyncio as _aio2
+            ok, task = await _aio2.get_running_loop().run_in_executor(
+                None, pikpak_client.get_task, dup["pikpak_task_id"])
+            prog = pikpak_client.task_progress_summary(task) if ok else "查询中…"
+            await thinking.edit_text(
+                f"📮 <code>{_esc(code)}</code> 已在 PikPak 离线中（#{rid}）\n{prog}",
+                parse_mode=ParseMode.HTML)
+            return
+        # 正在处理 → 简单提示
         if rid in _download_tasks:
-            p = downloader.get_progress(rid)
-            if p and p.get("total"):
-                pct = min(100.0, p["downloaded"] / p["total"] * 100)
-                bar = "█" * int(pct // 10) + "░" * (10 - int(pct // 10))
-                await thinking.edit_text(
-                    f"📮 <code>{_esc(code)}</code> 正在下载中（#{rid}）\n"
-                    f"[{bar}] {pct:.0f}% · {p['speed'] / 1024 / 1024:.1f}MB/s",
-                    parse_mode=ParseMode.HTML)
-            else:
-                await thinking.edit_text(
-                    f"📮 <code>{_esc(code)}</code> 正在下载中（#{rid}）…",
-                    parse_mode=ParseMode.HTML)
+            await thinking.edit_text(
+                f"📮 <code>{_esc(code)}</code> 正在处理中（#{rid}）…",
+                parse_mode=ParseMode.HTML)
             return
         # pending 但没有下载任务在跑 → 自动重新触发（比如重启后被重置的）
         if (dup["status"] == "pending" and config.AUTO_DOWNLOAD):
@@ -390,7 +393,7 @@ async def handle_request(msg, code: str, user_id: int, username: str, app: Appli
             magnets = (result or {}).get("magnets") or []
             if magnets:
                 await thinking.edit_text(
-                    f"📮 <code>{_esc(code)}</code> 已在队列（#{rid}），重新开始下载…",
+                    f"📮 <code>{_esc(code)}</code> 已在队列（#{rid}），重新加入 PikPak…",
                     parse_mode=ParseMode.HTML)
                 start_download(app, rid, magnets, auto=True)
                 return
@@ -468,9 +471,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if is_adm:
         text += ("<b>管理员</b>\n"
                  "/pending — 未完结求片\n"
-                 "/progress — 下载进度\n"
-                 "/retry <code>id或番号</code> — 重试下载\n"
-                 "私聊发磁力链接 — 选求片下载（可覆盖自动下载）\n"
+                 "/progress — PikPak离线进度\n"
+                 "/retry <code>id或番号</code> — 重试加入PikPak\n"
+                 "私聊发磁力链接 — 选求片加入PikPak（可覆盖）\n"
                  "/cancel <code>id或番号</code> — 取消求片\n"
                  "/done <code>id</code> — 手动标记入库\n"
                  "/stats — 求片统计\n")
@@ -582,43 +585,37 @@ async def inline_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------- handlers：管理员 ----------
 async def cmd_progress(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """管理员查看下载进度。"""
+    """管理员查看 PikPak 离线下载进度。"""
     if not is_admin(update.effective_user.id):
         return
-    rows = db.list_by_status(("downloading", "uploading"))
+    rows = db.list_by_status(("pikpak_queued",))
     if not rows:
-        await update.message.reply_text("📭 没有进行中的下载。")
+        await update.message.reply_text("📭 PikPak 里没有进行中的离线任务。")
         return
-    lines = ["📊 <b>下载进度</b>"]
+    lines = ["📊 <b>PikPak 离线进度</b>"]
+    import asyncio as _aio
+    loop = _aio.get_running_loop()
     for r in rows:
-        p = downloader.get_progress(r["id"])
         head = f"\n#{r['id']} <code>{_esc(r['code'])}</code>"
-        if not p:
-            # 没有进度数据：可能是任务刚启动，或僵尸任务（自愈）
-            if r["id"] not in _download_tasks:
-                db.update_status(r["id"], "pending")
-                lines.append(f"{head} — ⚠️ 任务已失效，退回待处理")
-            else:
-                lines.append(f"{head} — ⏳ 准备中…")
+        task_id = (r.get("pikpak_task_id") or "").strip()
+        if not task_id:
+            lines.append(f"{head} — ⏳ 等待加入…")
             continue
-        # 已耗时
-        elapsed = ""
-        if p.get("started"):
-            mins = int((time.time() - p["started"]) / 60)
-            elapsed = f" · 已用{mins}分钟" if mins else " · 刚开始"
-        if p["phase"] == "uploading":
-            lines.append(f"{head} — 📤 上传 Drive 中…{elapsed}")
+        ok, task = await loop.run_in_executor(
+            None, pikpak_client.get_task, task_id)
+        if not ok:
+            lines.append(f"{head} — ⚠️ 查不到任务：{_esc(str(task)[:60])}")
             continue
-        if p["phase"] == "metadata":
-            lines.append(f"{head} — 🔍 获取种子元数据…{elapsed}")
+        phase = task.get("phase", "")
+        if phase == "PHASE_TYPE_COMPLETE":
+            db.update_status(r["id"], "pikpak_done")
+            lines.append(f"{head} — ✅ 已下完")
             continue
-        total = p["total"] or 1
-        pct = min(100.0, p["downloaded"] / total * 100)
-        bar = "█" * int(pct // 10) + "░" * (10 - int(pct // 10))
-        speed = p["speed"] / 1024 / 1024
-        lines.append(
-            f"{head}\n[{bar}] {pct:.0f}%\n"
-            f"{p['downloaded'] / 1e9:.2f}GB / {total / 1e9:.2f}GB · {speed:.1f}MB/s")
+        if phase == "PHASE_TYPE_ERROR":
+            db.update_status(r["id"], "failed")
+            lines.append(f"{head} — ❌ 失败：{_esc(task.get('message','')[:60])}")
+            continue
+        lines.append(f"{head} — ☁️ {pikpak_client.task_progress_summary(task)}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -632,13 +629,8 @@ async def cmd_my(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         emoji = STATUS_EMOJI.get(r["status"], "•")
         line = f"\n#{r['id']} <code>{_esc(r['code'])}</code> {emoji}"
-        if r["id"] in _download_tasks:
-            p = downloader.get_progress(r["id"])
-            if p and p.get("total"):
-                pct = min(100.0, p["downloaded"] / p["total"] * 100)
-                line += f" {pct:.0f}%"
-            else:
-                line += " 下载中…"
+        if r["status"] == "pikpak_queued":
+            line += " PikPak离线中"
         else:
             line += f" {_esc(r['status'])}"
         if r.get("title_cn"):
@@ -703,7 +695,7 @@ async def magnet_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def dl_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """管理员选定求片 → 开始下载（可覆盖自动下载）。"""
+    """管理员选定求片 → 加入 PikPak（可覆盖自动添加）。"""
     query = update.callback_query
     await query.answer()
     parts = (query.data or "").split(":")
@@ -716,7 +708,7 @@ async def dl_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ 磁力或求片已失效。")
         return
     await query.edit_message_text(
-        f"⬇️ 开始下载 <code>{_esc(req['code'])}</code>（#{rid}）…\n只下最大视频文件，稍候。",
+        f"☁️ 加入 PikPak <code>{_esc(req['code'])}</code>（#{rid}）…\n稍候。",
         parse_mode=ParseMode.HTML)
     start_download(ctx.application, rid, [{"magnet": magnet, "label": "管理员手动提供"}],
                    notify_chat_id=query.message.chat_id, auto=False)
@@ -749,9 +741,9 @@ def _magnet_info(m: dict) -> tuple[str, str]:
     return link, f"{m.get('name') or ''} [{cnsub}·{jdb.format_size(m.get('size'))}]"
 
 
-async def _download_worker(app: Application, rid: int, magnets: list,
-                           notify_chat_id: int | None, auto: bool):
-    """下载 → 传 Drive → 群通知，全流程后台任务。多磁力依次重试。"""
+async def _pikpak_worker(app: Application, rid: int, magnets: list,
+                         notify_chat_id: int | None, auto: bool):
+    """PikPak 离线下载：取最优磁力 → 加入 PikPak → 群通知。"""
     req = db.get_request(rid)
     if not req or not magnets:
         return
@@ -765,61 +757,40 @@ async def _download_worker(app: Application, rid: int, magnets: list,
                 pass
 
     src = "🤖 自动" if auto else "🛠️ 管理员"
-    await send_report(app, req, f"下载报告 #{rid}", "⬇️",
-                      f"⬇️ 状态：正在下载…（{src}，共 {len(magnets)} 个磁力源）")
-
-    local_path, info, ok_magnet = None, "", ""
-    dest_dir = os.path.join(config.DOWNLOAD_DIR, req["code"])
-    for i, m in enumerate(magnets):
-        magnet, label = _magnet_info(m)
-        if not magnet:
-            continue
-        db.update_status(rid, "downloading", magnet=magnet)
-        log.info("#%d trying magnet %d/%d: %s", rid, i + 1, len(magnets), label[:60])
-        try:
-            local_path, info = await downloader.download_largest_video(magnet, dest_dir, rid=rid)
-        except asyncio.CancelledError:
-            db.update_status(rid, "pending", magnet="")
-            downloader.clear_progress(rid)
-            await post_to_group(app, f"🔄 <b>#{rid}</b> 下载被新的磁力替换。")
-            raise
-        downloader.clear_progress(rid)
-        if local_path:
-            ok_magnet = magnet
-            break
-        # 这个磁力失败，试下一个
-        msg = (f"⚠️ <b>#{rid}</b> 磁力 {i + 1}/{len(magnets)} 失败：{_esc(info[:100])}\n"
-               f"尝试下一个…")
-        await post_to_group(app, msg)
-        await _notify_admin(msg)
-
-    if not local_path:
-        db.update_status(rid, "pending", magnet="")
-        await send_report(app, req, f"下载报告 #{rid}", "❌",
-                          "❌ 状态：所有磁力都失败，已退回待处理")
-        await _notify_admin(
-            f"❌ <b>#{rid}</b> <code>{_esc(req['code'])}</code> 所有磁力都失败了，"
-            f"已退回待处理。")
-        return
-
-    # 上传 Drive
-    db.update_status(rid, "uploading", magnet=ok_magnet)
-    downloader.set_phase(rid, "uploading")
-    await _notify_admin(f"📤 <b>#{rid}</b> 下载完成，正在上传 Drive…\n{_esc(info)}")
-    ok, drive_info = await drive.upload_to_drive(local_path)
-    downloader.clear_progress(rid)
-    if not ok:
+    magnet, label = _magnet_info(magnets[0])
+    if not magnet:
         db.update_status(rid, "failed")
-        msg = f"❌ <b>#{rid}</b> Drive 上传失败：{_esc(drive_info)}"
+        await send_report(app, req, f"求片报告 #{rid}", "❌",
+                          "❌ 状态：无可用磁力")
+        return
+
+    await send_report(app, req, f"求片报告 #{rid}", "☁️",
+                      f"☁️ 状态：正在加入 PikPak 离线下载…（{src}）")
+
+    import asyncio as _aio
+    loop = _aio.get_running_loop()
+    ok, result = await loop.run_in_executor(
+        None, pikpak_client.add_offline_task, magnet, req["code"])
+    if not ok:
+        db.update_status(rid, "failed", magnet=magnet)
+        msg = f"❌ <b>#{rid}</b> 加入 PikPak 失败：{_esc(result[:120])}"
         await post_to_group(app, msg)
         await _notify_admin(msg)
         return
-    db.update_status(rid, "uploaded", drive_path=drive_info)
 
-    # 群通知（统一报告风格）
-    await send_report(app, req, f"上传报告 #{rid}", "📥",
-                      "📥 状态：已上传，等待入库")
-    await _notify_admin(f"✅ #{rid} 处理完成：{_esc(drive_info)}")
+    db.update_status(rid, "pikpak_queued", magnet=magnet, pikpak_task_id=result)
+    log.info("#%d pikpak task %s: %s", rid, result, req["code"])
+    await send_report(app, req, f"求片报告 #{rid}", "☁️",
+                      "☁️ 状态：已加入 PikPak 离线下载\n"
+                      f"🧲 {_esc(label[:80])}\n"
+                      "用 /progress 查看进度")
+    await _notify_admin(f"☁️ #{rid} <code>{_esc(req['code'])}</code> 已加入 PikPak 离线")
+
+
+# 旧 aria2 下载流程已停用（改走 PikPak），保留空壳兼容
+async def _download_worker(app: Application, rid: int, magnets: list,
+                           notify_chat_id: int | None, auto: bool):
+    await _pikpak_worker(app, rid, magnets, notify_chat_id, auto)
 
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -835,13 +806,13 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     rid = req["id"]
     db.update_status(rid, "cancelled")
-    # 取消进行中的下载任务
+    # 取消进行中的任务
     task = _download_tasks.pop(rid, None)
     if task and not task.done():
         task.cancel()
-    downloader.clear_progress(rid)
     await update.message.reply_text(
-        f"🚫 #{rid} <code>{_esc(req['code'])}</code> 已取消。",
+        f"🚫 #{rid} <code>{_esc(req['code'])}</code> 已取消。"
+        f"（PikPak 里的离线任务需手动删除）",
         parse_mode=ParseMode.HTML)
 
 
@@ -858,7 +829,7 @@ async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     rid = req["id"]
     if rid in _download_tasks:
-        await update.message.reply_text(f"⏳ #{rid} 正在下载中，无需重试。",
+        await update.message.reply_text(f"⏳ #{rid} 正在 PikPak 离线中，无需重试。",
                                         parse_mode=ParseMode.HTML)
         return
     thinking = await update.message.reply_text(f"🔍 正在找 <code>{_esc(req['code'])}</code> 的磁力…",
@@ -872,7 +843,7 @@ async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     start_download(ctx.application, rid, magnets, auto=True,
                    notify_chat_id=update.effective_chat.id)
     await update.message.reply_text(
-        f"🔄 #{rid} <code>{_esc(req['code'])}</code> 已重新开始下载。",
+        f"🔄 #{rid} <code>{_esc(req['code'])}</code> 已重新加入 PikPak。",
         parse_mode=ParseMode.HTML)
 
 
@@ -946,12 +917,43 @@ async def _start_webhook_server(bot_app: Application):
     log.info("emby webhook listening on :%d/emby-webhook", config.WEBHOOK_PORT)
 
 
+def _kill_stale_aria2():
+    """杀掉上一个 bot 实例留下的 aria2c 孤儿进程（只杀命令行里带 bot 下载目录的），
+    避免它们与恢复后新启动的 aria2 抢写同一个文件。"""
+    import signal
+    try:
+        out = subprocess.run(["pgrep", "-af", "aria2c"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except Exception as e:
+        log.warning("pgrep aria2c failed: %s", e)
+        return
+    killed = 0
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid_s, cmd = parts
+        if config.DOWNLOAD_DIR not in cmd:
+            continue
+        try:
+            os.kill(int(pid_s), signal.SIGTERM)
+            killed += 1
+        except (OSError, ValueError):
+            pass
+    if killed:
+        log.info("killed %d stale aria2c process(es)", killed)
+
+
 async def _post_init(app: Application):
-    # 启动时恢复：上次异常中断的 downloading/uploading 重置为 pending
-    #（重启后内存中的任务和进度都丢了，DB 状态会变成僵尸）
+    # 启动时恢复：旧 aria2 流程已停用，downloading/uploading 遗留状态退回 pending；
+    # pikpak_queued 的任务在 PikPak 云端继续，不用管，/progress 可查。
     for r in db.list_by_status(("downloading", "uploading")):
         db.update_status(r["id"], "pending")
-        log.info("reset stale %s #%d to pending", r["code"], r["id"])
+        log.info("reset stale %s #%d to pending (aria2 retired)", r["code"], r["id"])
+    n_pikpak = len(db.list_by_status(("pikpak_queued",)))
+    if n_pikpak:
+        log.info("%d pikpak_queued task(s) continue in cloud", n_pikpak)
+    admin_id = next(iter(config.ADMIN_IDS), None)
 
     # 左下角命令菜单：默认用户 + 管理员专属
     user_cmds = [

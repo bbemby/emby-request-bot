@@ -41,6 +41,10 @@ class Config:
     # 求片后自动下载（中文优先的最优磁力），默认开
     AUTO_DOWNLOAD: bool = _get("AUTO_DOWNLOAD", "true").lower() not in ("0", "false", "no")
 
+    # PikPak 离线下载（替代 aria2 本地下载）：求片后自动把最优磁力加到 PikPak
+    PIKPAK_REFRESH_TOKEN: str = _get("PIKPAK_REFRESH_TOKEN")
+    PIKPAK_FOLDER_ID: str = _get("PIKPAK_FOLDER_ID")  # 目标文件夹 ID，空=根目录
+
     # 磁力元数据获取超时（秒），超时换下一个磁力重试
     META_TIMEOUT: int = int(_get("META_TIMEOUT", "120") or 120)
 

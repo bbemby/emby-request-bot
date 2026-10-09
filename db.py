@@ -27,9 +27,18 @@ CREATE INDEX IF NOT EXISTS idx_code ON requests(code);
 CREATE INDEX IF NOT EXISTS idx_status ON requests(status);
 """
 
-# pending: 等管理员处理 / downloading: 下载中 / uploading: 上传Drive中
-# uploaded: 已传Drive待入库 / fulfilled: 已入库 / cancelled: 已取消 / failed: 失败
-ACTIVE_STATUSES = ("pending", "downloading", "uploading", "uploaded")
+# pending: 等管理员处理 / downloading: 下载中（旧 aria2 流程，保留兼容）
+# uploading: 上传Drive中（旧流程）/ uploaded: 已传Drive待入库（旧流程）
+# pikpak_queued: 已加入 PikPak 离线 / pikpak_done: PikPak 下载完成
+# fulfilled: 已入库 / cancelled: 已取消 / failed: 失败
+ACTIVE_STATUSES = ("pending", "downloading", "uploading", "uploaded",
+                   "pikpak_queued", "pikpak_done")
+
+
+def _migrate(c):
+    cols = {r[1] for r in c.execute("PRAGMA table_info(requests)")}
+    if "pikpak_task_id" not in cols:
+        c.execute("ALTER TABLE requests ADD COLUMN pikpak_task_id TEXT DEFAULT ''")
 
 
 def _conn():
@@ -42,6 +51,7 @@ def _conn():
 def init_db():
     with _conn() as c:
         c.executescript(SCHEMA)
+        _migrate(c)
 
 
 def add_request(code: str, title_cn: str, user_id: int, username: str) -> int:
@@ -65,7 +75,7 @@ def find_active_by_code(code: str) -> dict | None:
     """找该番号未完结的求片（去重用）。"""
     with _conn() as c:
         row = c.execute(
-            "SELECT * FROM requests WHERE code = ? AND status IN ('pending','downloading','uploaded')"
+            "SELECT * FROM requests WHERE code = ? AND status IN ('pending','downloading','uploaded','pikpak_queued','pikpak_done')"
             " ORDER BY id LIMIT 1",
             (code.upper(),),
         ).fetchone()
