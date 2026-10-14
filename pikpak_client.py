@@ -1,9 +1,11 @@
 """PikPak 离线下载对接：求片后自动把磁力加到 PikPak 云端下载。
 
 用 refresh_token 换 access_token（自动续期），失败时返回 (False, 原因)。
+轮换下来的新 refresh_token 会写回 .env，避免重启后用回过期 token。
 """
 import json
 import logging
+import os
 import time
 import urllib.request
 
@@ -39,6 +41,36 @@ def _get(url: str, token: str) -> dict:
         return json.load(r)
 
 
+def _persist_refresh_token(new_token: str) -> None:
+    """把轮换后的 refresh_token 写回 .env 文件（与本文件同目录的 .env）。
+
+    服务器上 systemd 用 EnvironmentFile=/root/emby-request-bot/.env 加载配置，
+    必须落盘，否则重启后又会读回过期 token。
+    """
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    lines: list[str] = []
+    found = False
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("PIKPAK_REFRESH_TOKEN"):
+                lines[i] = f"PIKPAK_REFRESH_TOKEN={new_token}\n"
+                found = True
+    if not found:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append(f"PIKPAK_REFRESH_TOKEN={new_token}\n")
+    # 写到临时文件再原子替换，避免写一半被 systemd 读到
+    tmp_path = env_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, env_path)
+    log.info("已把轮换后的 PIKPAK_REFRESH_TOKEN 写回 .env")
+
+
 def get_access_token() -> tuple[bool, str]:
     """返回 (成功, access_token或原因)。自动用 refresh_token 续期。"""
     now = time.time()
@@ -60,9 +92,16 @@ def get_access_token() -> tuple[bool, str]:
         return False, f"token 刷新失败：{str(d)[:120]}"
     _token_cache["access_token"] = at
     _token_cache["expires_at"] = now + int(d.get("expires_in", 3600))
-    # refresh_token 可能会轮换，写回配置（仅内存，重启后从 .env 读）
-    if d.get("refresh_token"):
-        config.PIKPAK_REFRESH_TOKEN = d["refresh_token"]
+    # refresh_token 可能会轮换：先写内存保证本次运行可用，再写回 .env
+    # 保证重启后 systemd 从 .env 读到的是最新 token，不会用回过期 token
+    new_refresh = d.get("refresh_token")
+    if new_refresh:
+        config.PIKPAK_REFRESH_TOKEN = new_refresh
+        if new_refresh != refresh:
+            try:
+                _persist_refresh_token(new_refresh)
+            except Exception as e:
+                log.warning("refresh_token 写回 .env 失败：%s", e)
     return True, at
 
 
