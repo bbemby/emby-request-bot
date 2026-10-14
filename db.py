@@ -105,6 +105,22 @@ def set_cover_file_id(rid: int, file_id: str):
         c.execute("UPDATE requests SET cover_file_id = ? WHERE id = ?", (file_id, rid))
 
 
+def try_fulfill(rid: int) -> bool:
+    """原子地将未完结求片标为已入库。
+
+    只有当行仍处于未完结状态时才更新，返回 True 表示本次调用实际发生了
+    状态变更（调用方据此决定是否发通知，避免并发检查导致重复通知）。
+    """
+    placeholders = ", ".join("?" * len(ACTIVE_STATUSES))
+    with _conn() as c:
+        cur = c.execute(
+            f"UPDATE requests SET status = 'fulfilled', updated_at = ?"
+            f" WHERE id = ? AND status IN ({placeholders})",
+            (time.time(), rid, *ACTIVE_STATUSES),
+        )
+        return cur.rowcount > 0
+
+
 def _day_start() -> float:
     return time.mktime(datetime.date.today().timetuple())
 
@@ -118,12 +134,20 @@ def count_user_today(user_id: int) -> int:
         return row[0] if row else 0
 
 
-def get_user_requests(user_id: int, limit: int = 10) -> list[dict]:
+def get_user_requests(user_id: int, limit: int = 10, offset: int = 0) -> list[dict]:
     with _conn() as c:
         rows = c.execute(
-            "SELECT * FROM requests WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
-            (user_id, limit)).fetchall()
+            "SELECT * FROM requests WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (user_id, limit, offset)).fetchall()
         return [dict(r) for r in rows]
+
+
+def count_user_requests(user_id: int) -> int:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT COUNT(*) FROM requests WHERE user_id = ?",
+            (user_id,)).fetchone()
+        return row[0] if row else 0
 
 
 def get_stats() -> dict:

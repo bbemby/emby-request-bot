@@ -31,8 +31,18 @@ class Config:
     # 调度
     CHECK_INTERVAL_MIN: int = int(_get("CHECK_INTERVAL_MIN", "30") or 30)
 
-    # 每人每天求片上限（0=不限）
-    DAILY_LIMIT: int = int(_get("DAILY_LIMIT", "5") or 5)
+    # 求片规则（bb_boss 联动）：普通用户每天5次、每次20子弹；白名单每天20次、每次10子弹
+    # 旧 DAILY_LIMIT 已废弃，保留读取兼容但不再使用
+    DAILY_LIMIT: int = int(_get("DAILY_LIMIT", "10") or 10)
+    REQ_DAILY_NORMAL: int = int(_get("REQ_DAILY_NORMAL", "5") or 5)
+    REQ_COST_NORMAL: int = int(_get("REQ_COST_NORMAL", "20") or 20)
+    REQ_DAILY_WHITELIST: int = int(_get("REQ_DAILY_WHITELIST", "20") or 20)
+    REQ_COST_WHITELIST: int = int(_get("REQ_COST_WHITELIST", "10") or 10)
+    REQ_FREE_DAILY: int = int(_get("REQ_FREE_DAILY", "2") or 2)  # 每天前 N 次免费
+
+    # bb_boss 用户系统（Emby 账号校验 + 子弹扣费）
+    BBOSS_API_URL: str = _get("BBOSS_API_URL", "http://168.110.122.21:8838")
+    BBOSS_API_TOKEN: str = _get("BBOSS_API_TOKEN")
 
     # Emby webhook 接收端口（Emby装webhook插件后POST到 http://服务器:端口/emby-webhook）
     WEBHOOK_PORT: int = int(_get("WEBHOOK_PORT", "8080") or 8080)

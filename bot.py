@@ -52,6 +52,7 @@ import downloader  # 旧 aria2 流程，已停用（保留兼容）
 import drive  # 旧 Drive 上传，已停用（保留兼容）
 import pikpak_client
 import emby_client
+import bbboss_client
 import javdb_client as jdb
 from config import config
 from translator import translate
@@ -402,14 +403,44 @@ async def handle_request(msg, code: str, user_id: int, username: str, app: Appli
             parse_mode=ParseMode.HTML)
         return
 
-    # 2.5) 每日求片上限（防刷）
-    if config.DAILY_LIMIT > 0:
-        n = db.count_user_today(user_id)
-        if n >= config.DAILY_LIMIT:
+    # 2.5) bb_boss 门禁：Emby 账号 + 每日次数 + 子弹（bot 管理员跳过）
+    rule = None  # (是否白名单, 每日上限, 单次费用, 身份名, 是否免费)
+    if not is_admin(user_id):
+        import asyncio as _aio_bb
+        loop_bb = _aio_bb.get_running_loop()
+        status, buser = await loop_bb.run_in_executor(
+            None, bbboss_client.get_user, user_id)
+        if status == "api_error":
             await thinking.edit_text(
-                f"🚫 你今天求片已达上限（{config.DAILY_LIMIT}部/天），明天再来吧！",
+                "⚠️ 用户系统暂时连不上，稍后再试。",
                 parse_mode=ParseMode.HTML)
             return
+        if status == "no_user" or not bbboss_client.has_emby_account(buser):
+            await thinking.edit_text(
+                "❌ 求片需要先绑定步兵营地 Emby 账号。\n"
+                "请先去 @bb_boss 完成绑定，再来求片！",
+                parse_mode=ParseMode.HTML)
+            return
+        wl = bbboss_client.is_whitelist(buser)
+        daily = config.REQ_DAILY_WHITELIST if wl else config.REQ_DAILY_NORMAL
+        cost = config.REQ_COST_WHITELIST if wl else config.REQ_COST_NORMAL
+        label = "白名单" if wl else "普通用户"
+        n = db.count_user_today(user_id)
+        if n >= daily:
+            await thinking.edit_text(
+                f"🚫 你今天求片已达上限（{label} {daily}次/天），明天再来吧！",
+                parse_mode=ParseMode.HTML)
+            return
+        free = n < config.REQ_FREE_DAILY
+        if not free:
+            bullets = int((buser or {}).get("iv") or 0)
+            if bullets < cost:
+                await thinking.edit_text(
+                    f"🪙 子弹不足！本次求片需要 {cost} 子弹，你只有 {bullets}。\n"
+                    "去 @bb_boss 签到补充子弹吧！",
+                    parse_mode=ParseMode.HTML)
+                return
+        rule = (wl, daily, cost, label, free)
 
     # 3) 取影片信息
     result = await fetch_movie(code)
@@ -420,44 +451,132 @@ async def handle_request(msg, code: str, user_id: int, username: str, app: Appli
     d = result["detail"]
     title_cn = translate(d.get("title") or "", src="ja")
 
+    # 3.5) 扣子弹（每天前 N 次免费；bot 管理员免扣）
+    cost_info = ""
+    if rule:
+        _, _, cost, _, free = rule
+        if free:
+            cost_info = "（今日免费）"
+        else:
+            import asyncio as _aio_dd
+            ok, res = await _aio_dd.get_running_loop().run_in_executor(
+                None, bbboss_client.deduct_bullets, user_id, cost)
+            if not ok:
+                await thinking.edit_text(
+                    f"⚠️ 扣费失败（{_esc(str(res))}），本次求片未受理，请稍后再试。",
+                    parse_mode=ParseMode.HTML)
+                return
+            cost_info = f"（已扣 {cost} 子弹，余额 {res}）"
+
     # 4) 入库
     rid = db.add_request(code, title_cn, user_id, username)
 
-    # 5) 封面 + 群通知（统一报告风格）
+    # 5) 封面（群通知只发一条：等 PikPak 结果出来由 worker 统一发）
     cover = d.get("cover_url")
     cover_path = await _download_cover(code, cover) if cover else None
-    req = {"id": rid, "code": code, "title_cn": title_cn,
-           "username": username, "user_id": user_id}
-    file_id = await send_report(app, req, f"求片报告 #{rid}", "📩",
-                                "⏳ 状态：排队等待下载", cover_path)
-    if file_id:
-        db.set_cover_file_id(rid, file_id)
-    if cover_path:
-        shutil.rmtree(os.path.dirname(cover_path), ignore_errors=True)
 
     await thinking.edit_text(
-        f"📩 求片 <code>{_esc(code)}</code> 已登记（#{rid}），入库后会通知你！",
+        f"📩 求片 <code>{_esc(code)}</code> 已登记（#{rid}）{cost_info}，入库后会通知你！",
         parse_mode=ParseMode.HTML)
 
-    # 6) 自动下载：依次尝试最优磁力（中字优先）
-    magnets = result["magnets"]
-    if config.AUTO_DOWNLOAD and magnets:
-        start_download(app, rid, magnets, auto=True)
-    elif not magnets:
-        await post_to_group(
-            app, f"⏳ <b>#{rid}</b> <code>{_esc(code)}</code> 暂无磁力源，等待管理员手动提供磁力。")
+    # 6) 自动下载：依次尝试最优磁力（中字优先）；无磁力也进 worker，由它发唯一的群通知
+    if config.AUTO_DOWNLOAD:
+        start_download(app, rid, result["magnets"], auto=True, cover_path=cover_path)
+    elif cover_path:
+        shutil.rmtree(os.path.dirname(cover_path), ignore_errors=True)
 
 
 # ---------- handlers：用户 ----------
+def _request_rules_text() -> str:
+    return (
+        "📜 <b>求片规则</b>\n"
+        f"· 每天前 {config.REQ_FREE_DAILY} 次免费\n"
+        f"· 之后：普通用户每次 {config.REQ_COST_NORMAL} 子弹，白名单每次 {config.REQ_COST_WHITELIST} 子弹\n"
+        f"· 每日上限：普通 {config.REQ_DAILY_NORMAL} 次，白名单 {config.REQ_DAILY_WHITELIST} 次\n"
+        "· 求片前需绑定步兵营地 Emby 账号\n"
+        "· 已在库 / 已有人求过的不扣子弹"
+    )
+
+
+async def _build_start_panel(user_id: int, first_name: str) -> tuple[str, InlineKeyboardMarkup]:
+    """组装 /start 面板（参考 bb_boss 用户面板风格）。"""
+    name = _esc(first_name or "")
+    if is_admin(user_id):
+        text = (
+            f"▎欢迎来到求片面板！{name}\n\n"
+            f"· 🆔 TG ID | <code>{user_id}</code>\n"
+            f"· 📊 身份 | 👮 管理员（求片不限次、免子弹）\n\n"
+            f"{_request_rules_text()}\n\n"
+            "<code>/s 番号</code> — 搜番\n"
+            "<code>/q 番号</code> — 求片（私聊直接发番号也行）\n"
+            "<code>/my</code> — 我的求片 · 📷 私聊发图 — 以图搜番"
+        )
+    else:
+        status, buser = await asyncio.get_running_loop().run_in_executor(
+            None, bbboss_client.get_user, user_id)
+        if status == "ok" and buser:
+            emby_name = buser.get("name")
+            emby_line = f"📺 Emby 账号 | <code>{_esc(emby_name)}</code>" if emby_name else \
+                "📺 Emby 账号 | ❌ 未绑定（先去 @bb_boss 绑定）"
+            bullets = int(buser.get("iv") or 0)
+            ident = "白名单" if bbboss_client.is_whitelist(buser) else "普通用户"
+        elif status == "no_user":
+            emby_line = "📺 Emby 账号 | ❌ 未绑定（先去 @bb_boss 绑定）"
+            bullets = 0
+            ident = "普通用户"
+        else:
+            emby_line = "📺 Emby 账号 | ⚠️ 用户系统连不上"
+            bullets = 0
+            ident = "普通用户"
+        free_left = max(0, config.REQ_FREE_DAILY - db.count_user_today(user_id))
+        text = (
+            f"▎欢迎来到求片面板！{name}\n\n"
+            f"· 🆔 TG ID | <code>{user_id}</code>\n"
+            f"· {emy_line}\n"
+            f"· 🍒 子弹 | {bullets}\n"
+            f"· 📊 身份 | {ident}\n"
+            f"· 🆓 今日免费剩余 | {free_left} 次\n\n"
+            f"{_request_rules_text()}\n\n"
+            "<code>/s 番号</code> — 搜番\n"
+            "<code>/q 番号</code> — 求片（私聊直接发番号也行）\n"
+            "<code>/my</code> — 我的求片 · 📷 私聊发图 — 以图搜番"
+        )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 刷新面板", callback_data="qp:refresh"),
+         InlineKeyboardButton("❌ 关闭", callback_data="qp:close")],
+    ])
+    return text, kb
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 <b>Emby 求片 Bot</b>\n\n"
-        "<code>/s 番号</code> — 搜番看简介/封面/磁力\n"
-        "<code>/q 番号</code> — 求片（私聊直接发番号也行）\n"
-        "<code>/my</code> — 我的求片\n"
-        "📷 私聊发图 — 以图搜番\n\n"
-        "求片后入库会自动通知！",
-        parse_mode=ParseMode.HTML)
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("请私聊我使用 /start 面板。")
+        return
+    user = update.effective_user
+    text, kb = await _build_start_panel(user.id, user.first_name)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML,
+                                    reply_markup=kb)
+
+
+async def panel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """求片面板按钮：刷新 / 关闭。"""
+    query = update.callback_query
+    await query.answer()
+    action = (query.data or "").split(":", 1)[1] if ":" in (query.data or "") else ""
+    if action == "close":
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        return
+    if action == "refresh":
+        user = query.from_user
+        text, kb = await _build_start_panel(user.id, user.first_name)
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML,
+                                          reply_markup=kb)
+        except Exception:
+            pass
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -467,7 +586,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/s <code>番号</code> — 搜番\n"
             "/q <code>番号</code> — 求片\n"
             "私聊发番号 / 发图 — 求片 / 以图搜番\n"
-            "/my — 我的求片记录\n\n")
+            "/my — 我的求片记录\n\n"
+            + _request_rules_text() + "\n\n")
     if is_adm:
         text += ("<b>管理员</b>\n"
                  "/pending — 未完结求片\n"
@@ -619,13 +739,18 @@ async def cmd_progress(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
-async def cmd_my(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """用户查看自己的求片记录和状态。"""
-    rows = db.get_user_requests(update.effective_user.id)
-    if not rows:
-        await update.message.reply_text("📭 你还没有求过片。")
-        return
-    lines = ["📋 <b>我的求片</b>"]
+MY_PAGE_SIZE = 10
+
+
+def _my_page_text(user_id: int, page: int) -> tuple:
+    """组装我的求片某一页。(文本, 按钮)"""
+    total = db.count_user_requests(user_id)
+    if total == 0:
+        return "📭 你还没有求过片。", None
+    pages = (total + MY_PAGE_SIZE - 1) // MY_PAGE_SIZE
+    page = max(0, min(page, pages - 1))
+    rows = db.get_user_requests(user_id, MY_PAGE_SIZE, page * MY_PAGE_SIZE)
+    lines = [f"📋 <b>我的求片</b>（{page + 1}/{pages}，共 {total}）"]
     for r in rows:
         emoji = STATUS_EMOJI.get(r["status"], "•")
         line = f"\n#{r['id']} <code>{_esc(r['code'])}</code> {emoji}"
@@ -636,7 +761,34 @@ async def cmd_my(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if r.get("title_cn"):
             line += f"\n<i>{_esc(r['title_cn'][:40])}</i>"
         lines.append(line)
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    btns = []
+    if page > 0:
+        btns.append(InlineKeyboardButton("◀ 上一页", callback_data=f"my:{page - 1}"))
+    if page < pages - 1:
+        btns.append(InlineKeyboardButton("下一页 ▶", callback_data=f"my:{page + 1}"))
+    kb = InlineKeyboardMarkup([btns]) if btns else None
+    return "\n".join(lines), kb
+
+
+async def cmd_my(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """用户查看自己的求片记录和状态（翻页）。"""
+    text, kb = _my_page_text(update.effective_user.id, 0)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def my_page_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """我的求片翻页按钮。"""
+    query = update.callback_query
+    await query.answer()
+    try:
+        page = int((query.data or "my:0").split(":")[1])
+    except (ValueError, IndexError):
+        page = 0
+    text, kb = _my_page_text(query.from_user.id, page)
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception:
+        pass
 
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -716,17 +868,18 @@ async def dl_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def start_download(app: Application, rid: int, magnets: list,
                    notify_chat_id: int | None = None,
-                   auto: bool = False):
+                   auto: bool = False, cover_path: str | None = None):
     """启动下载任务；已有任务会被取消并替换。
 
     magnets: 磁力 dict 列表（已按中字优先/体积排序），依次尝试直到成功。
     手动单磁力传 [{"magnet": magnet, "label": "..."}]。
+    cover_path: 求片时下载的封面，worker 发唯一群通知时用，用完即删。
     """
     old = _download_tasks.pop(rid, None)
     if old and not old.done():
         old.cancel()
     task = asyncio.create_task(
-        _download_worker(app, rid, magnets, notify_chat_id, auto))
+        _download_worker(app, rid, magnets, notify_chat_id, auto, cover_path))
     _download_tasks[rid] = task
     task.add_done_callback(lambda t: _download_tasks.pop(rid, None))
     return task
@@ -742,10 +895,12 @@ def _magnet_info(m: dict) -> tuple[str, str]:
 
 
 async def _pikpak_worker(app: Application, rid: int, magnets: list,
-                         notify_chat_id: int | None, auto: bool):
-    """PikPak 离线下载：取最优磁力 → 加入 PikPak → 群通知。"""
+                         notify_chat_id: int | None, auto: bool,
+                         cover_path: str | None = None):
+    """PikPak 离线下载：取最优磁力 → 加入 PikPak → 发唯一的群通知。"""
     req = db.get_request(rid)
-    if not req or not magnets:
+    if not req:
+        _cleanup_cover(cover_path)
         return
 
     async def _notify_admin(text: str):
@@ -756,16 +911,23 @@ async def _pikpak_worker(app: Application, rid: int, magnets: list,
             except Exception:
                 pass
 
-    src = "🤖 自动" if auto else "🛠️ 管理员"
+    async def _report(title_emoji: str, status_line: str):
+        """发本求片唯一的群通知（含封面），并缓存 cover file_id 供复用。"""
+        file_id = await send_report(app, req, f"求片报告 #{rid}", title_emoji,
+                                    status_line, cover_path)
+        if file_id:
+            db.set_cover_file_id(rid, file_id)
+        _cleanup_cover(cover_path)
+
+    if not magnets:
+        await _report("⏳", f"⏳ 状态：暂无磁力源，等待管理员手动提供磁力")
+        return
+
     magnet, label = _magnet_info(magnets[0])
     if not magnet:
         db.update_status(rid, "failed")
-        await send_report(app, req, f"求片报告 #{rid}", "❌",
-                          "❌ 状态：无可用磁力")
+        await _report("❌", "❌ 状态：无可用磁力")
         return
-
-    await send_report(app, req, f"求片报告 #{rid}", "☁️",
-                      f"☁️ 状态：正在加入 PikPak 离线下载…（{src}）")
 
     import asyncio as _aio
     loop = _aio.get_running_loop()
@@ -773,24 +935,29 @@ async def _pikpak_worker(app: Application, rid: int, magnets: list,
         None, pikpak_client.add_offline_task, magnet, req["code"])
     if not ok:
         db.update_status(rid, "failed", magnet=magnet)
-        msg = f"❌ <b>#{rid}</b> 加入 PikPak 失败：{_esc(result[:120])}"
-        await post_to_group(app, msg)
-        await _notify_admin(msg)
+        await _report("❌", f"❌ 状态：加入 PikPak 失败：{_esc(result[:120])}")
+        await _notify_admin(f"❌ <b>#{rid}</b> 加入 PikPak 失败：{_esc(result[:120])}")
         return
 
     db.update_status(rid, "pikpak_queued", magnet=magnet, pikpak_task_id=result)
     log.info("#%d pikpak task %s: %s", rid, result, req["code"])
-    await send_report(app, req, f"求片报告 #{rid}", "☁️",
-                      "☁️ 状态：已加入 PikPak 离线下载\n"
-                      f"🧲 {_esc(label[:80])}\n"
-                      "用 /progress 查看进度")
+    await _report("☁️",
+                  "☁️ 状态：已加入 PikPak 离线下载\n"
+                  f"🧲 {_esc(label[:80])}\n"
+                  "用 /progress 查看进度")
     await _notify_admin(f"☁️ #{rid} <code>{_esc(req['code'])}</code> 已加入 PikPak 离线")
+
+
+def _cleanup_cover(cover_path: str | None):
+    if cover_path:
+        shutil.rmtree(os.path.dirname(cover_path), ignore_errors=True)
 
 
 # 旧 aria2 下载流程已停用（改走 PikPak），保留空壳兼容
 async def _download_worker(app: Application, rid: int, magnets: list,
-                           notify_chat_id: int | None, auto: bool):
-    await _pikpak_worker(app, rid, magnets, notify_chat_id, auto)
+                           notify_chat_id: int | None, auto: bool,
+                           cover_path: str | None = None):
+    await _pikpak_worker(app, rid, magnets, notify_chat_id, auto, cover_path)
 
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -863,17 +1030,25 @@ async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- 定时检查入库 ----------
+_check_lock = asyncio.Lock()
+
+
 async def check_library_once(app: Application):
-    """检查一次入库，有入库的发群通知（定时任务和 webhook 共用）。"""
-    rows = db.list_by_status()
-    for r in rows:
-        in_lib, lib_name = emby_client.is_in_library(r["code"])
-        if in_lib:
-            db.update_status(r["id"], "fulfilled")
-            await send_report(app, r, "自动入库报告", "🎊",
-                              "✅ 状态：已存入媒体库，请刷新观看")
-            log.info("request #%d fulfilled: %s", r["id"], r["code"])
-        await asyncio.sleep(2)
+    """检查一次入库，有入库的发群通知（定时任务和 webhook 共用）。
+
+    用 try_fulfill 做原子状态变更：并发的检查任务里只有一个能真正把
+    状态翻成 fulfilled 并发通知，杜绝重复入库通知。
+    """
+    async with _check_lock:
+        rows = db.list_by_status()
+        for r in rows:
+            in_lib, lib_name = emby_client.is_in_library(r["code"])
+            if in_lib:
+                if db.try_fulfill(r["id"]):
+                    await send_report(app, r, "自动入库报告", "🎊",
+                                      "✅ 状态：已存入媒体库，请刷新观看")
+                    log.info("request #%d fulfilled: %s", r["id"], r["code"])
+            await asyncio.sleep(2)
 
 
 async def check_library_loop(app: Application):
@@ -1000,6 +1175,8 @@ def main():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CallbackQueryHandler(dl_pick, pattern=r"^dl:"))
     app.add_handler(CallbackQueryHandler(pick_candidate, pattern=r"^pick:"))
+    app.add_handler(CallbackQueryHandler(panel_callback, pattern=r"^qp:"))
+    app.add_handler(CallbackQueryHandler(my_page_callback, pattern=r"^my:"))
     app.add_handler(MessageHandler(filters.PHOTO, photo_search))
     app.add_handler(InlineQueryHandler(inline_search))
     # 私聊磁力 / 私聊裸番号（放最后，避免抢命令）
