@@ -62,7 +62,7 @@ def deduct_bullets(tg_id: int, amount: int) -> tuple[bool, int | str]:
         log.warning("bbboss deduct failed: %s", e)
         return False, "接口异常"
     if r.get("code") == 200:
-        return True, int(r["data"].get("iv", 0))
+        return True, int((r.get("data") or {}).get("iv", 0))
     return False, str(r.get("message") or "扣费失败")
 
 

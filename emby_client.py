@@ -10,6 +10,8 @@ from config import config
 log = logging.getLogger(__name__)
 
 # 已知需要补数字前缀的番号系列：请求 GANA-2535，库里是 200GANA-2535
+# 200 系是业余番号的通用编目惯例（不只 GANA），见 _code_variants 的通用规则；
+# 这里只放不符合 200 惯例的特殊映射（如 MIUM -> 300MIUM）。
 _PREFIX_MAP = {"GANA": "200GANA"}
 
 
@@ -27,8 +29,9 @@ def _code_variants(code: str) -> list[str]:
         variants.append(m.group(2))
     # 补数字前缀：GANA-2535 -> 200GANA-2535
     m = re.match(r"^([A-Z]+)-(\d+)$", code)
-    if m and m.group(1) in _PREFIX_MAP:
-        full = f"{_PREFIX_MAP[m.group(1)]}-{m.group(2)}"
+    if m:
+        full = _PREFIX_MAP.get(m.group(1), f"200{m.group(1)}")
+        full = f"{full}-{m.group(2)}"
         if full not in variants:
             variants.append(full)
     return variants

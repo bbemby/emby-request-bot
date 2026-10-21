@@ -86,12 +86,14 @@ def get_request(rid: int) -> dict | None:
 
 
 def find_active_by_code(code: str) -> dict | None:
-    """找该番号未完结的求片（去重用）。"""
+    """找该番号未完结的求片（去重用）。状态集合与 ACTIVE_STATUSES 保持一致，
+    别再手写列表（曾经漏过 uploading，导致锁内复查也拦不住）。"""
+    placeholders = ", ".join("?" * len(ACTIVE_STATUSES))
     with _conn() as c:
         row = c.execute(
-            "SELECT * FROM requests WHERE code = ? AND status IN ('pending','downloading','uploaded','pikpak_queued','pikpak_done')"
+            f"SELECT * FROM requests WHERE code = ? AND status IN ({placeholders})"
             " ORDER BY id LIMIT 1",
-            (code.upper(),),
+            (code.upper(), *ACTIVE_STATUSES),
         ).fetchone()
         return dict(row) if row else None
 

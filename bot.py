@@ -18,6 +18,7 @@
 import asyncio
 import contextlib
 import html
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 import re
@@ -243,8 +244,7 @@ async def send_result(msg, code: str):
     cover_path = await _download_cover(d.get("number") or "", cover) if cover else None
     cover_dir = os.path.dirname(cover_path) if cover_path else None
     if cover_path:
-        caption = await asyncio.get_running_loop().run_in_executor(
-            None, build_caption, d)
+        caption = await asyncio.get_running_loop().run_in_executor(_sync_executor, build_caption, d)
         try:
             with open(cover_path, "rb") as f:
                 await msg.reply_photo(photo=f, caption=caption,
@@ -254,8 +254,7 @@ async def send_result(msg, code: str):
         finally:
             if cover_dir:
                 shutil.rmtree(cover_dir, ignore_errors=True)
-    detail = await asyncio.get_running_loop().run_in_executor(
-        None, build_detail, d, magnets)
+    detail = await asyncio.get_running_loop().run_in_executor(_sync_executor, build_detail, d, magnets)
     await msg.reply_text(detail[:4000], parse_mode=ParseMode.HTML,
                          disable_web_page_preview=True)
 
@@ -366,8 +365,7 @@ async def handle_request(msg, code: str, user_id: int, username: str, app: Appli
     thinking = await msg.reply_text(f"📩 正在处理求片 <code>{_esc(code)}</code>…", parse_mode=ParseMode.HTML)
 
     # 1) 已在 Emby？（同步 urllib，必须扔出 event loop）
-    in_lib, lib_name = await asyncio.get_running_loop().run_in_executor(
-        None, emby_client.is_in_library, code)
+    in_lib, lib_name = await asyncio.get_running_loop().run_in_executor(_sync_executor, emby_client.is_in_library, code)
     if in_lib:
         await thinking.edit_text(
             f"✅ <code>{_esc(code)}</code> 已经在库了！\n{_esc(lib_name)}",
@@ -381,8 +379,7 @@ async def handle_request(msg, code: str, user_id: int, username: str, app: Appli
         # PikPak 离线中 → 显示 PikPak 进度
         if dup["status"] == "pikpak_queued" and dup.get("pikpak_task_id"):
             import asyncio as _aio2
-            ok, task = await _aio2.get_running_loop().run_in_executor(
-                None, pikpak_client.get_task, dup["pikpak_task_id"])
+            ok, task = await _aio2.get_running_loop().run_in_executor(_sync_executor, pikpak_client.get_task, dup["pikpak_task_id"])
             prog = pikpak_client.task_progress_summary(task) if ok else "查询中…"
             await thinking.edit_text(
                 f"📮 <code>{_esc(code)}</code> 已在 PikPak 离线中（#{rid}）\n{prog}",
@@ -414,8 +411,7 @@ async def handle_request(msg, code: str, user_id: int, username: str, app: Appli
     if not is_admin(user_id):
         import asyncio as _aio_bb
         loop_bb = _aio_bb.get_running_loop()
-        status, buser = await loop_bb.run_in_executor(
-            None, bbboss_client.get_user, user_id)
+        status, buser = await loop_bb.run_in_executor(_sync_executor, bbboss_client.get_user, user_id)
         if status == "api_error":
             await thinking.edit_text(
                 "⚠️ 用户系统暂时连不上，稍后再试。",
@@ -455,37 +451,44 @@ async def handle_request(msg, code: str, user_id: int, username: str, app: Appli
                                  parse_mode=ParseMode.HTML)
         return
     d = result["detail"]
-    title_cn = await asyncio.get_running_loop().run_in_executor(
-        None, lambda: translate(d.get("title") or "", src="ja"))
+    title_cn = await asyncio.get_running_loop().run_in_executor(_sync_executor, lambda: translate(d.get("title") or "", src="ja"))
 
     # 3.5) 扣子弹 + 入库：必须在同番号锁内先复查、再扣费、再插入。
     # 否则两人同时求同一番号会在步骤 2 双双通过查重，然后重复扣费、
     # 插出两条记录。每天前 N 次免费；bot 管理员免扣。
+    # Telegram 回复（网络 IO）一律移到锁外，锁内只做复查/扣费/插入。
+    dup2 = None
+    deduct_error = None
+    cost_info = ""
+    rid = None
     async with _request_lock(code):
         dup2 = db.find_active_by_code(code)
-        if dup2:
-            await thinking.edit_text(
-                f"📮 <code>{_esc(code)}</code> 已经有人求过了（#{dup2['id']}），排队中…",
-                parse_mode=ParseMode.HTML)
-            return
-        cost_info = ""
-        if rule:
-            _, _, cost, _, free = rule
-            if free:
-                cost_info = "（今日免费）"
-            else:
-                import asyncio as _aio_dd
-                ok, res = await _aio_dd.get_running_loop().run_in_executor(
-                    None, bbboss_client.deduct_bullets, user_id, cost)
-                if not ok:
-                    await thinking.edit_text(
-                        f"⚠️ 扣费失败（{_esc(str(res))}），本次求片未受理，请稍后再试。",
-                        parse_mode=ParseMode.HTML)
-                    return
-                cost_info = f"（已扣 {cost} 子弹，余额 {res}）"
-
-        # 4) 入库
-        rid = db.add_request(code, title_cn, user_id, username)
+        if dup2 is None:
+            if rule:
+                _, _, cost, _, free = rule
+                if free:
+                    cost_info = "（今日免费）"
+                else:
+                    import asyncio as _aio_dd
+                    ok, res = await _aio_dd.get_running_loop().run_in_executor(
+                        _sync_executor, bbboss_client.deduct_bullets, user_id, cost)
+                    if not ok:
+                        deduct_error = str(res)
+                    else:
+                        cost_info = f"（已扣 {cost} 子弹，余额 {res}）"
+            if deduct_error is None:
+                # 4) 入库
+                rid = db.add_request(code, title_cn, user_id, username)
+    if dup2 is not None:
+        await thinking.edit_text(
+            f"📮 <code>{_esc(code)}</code> 已经有人求过了（#{dup2['id']}），排队中…",
+            parse_mode=ParseMode.HTML)
+        return
+    if deduct_error is not None:
+        await thinking.edit_text(
+            f"⚠️ 扣费失败（{_esc(deduct_error)}），本次求片未受理，请稍后再试。",
+            parse_mode=ParseMode.HTML)
+        return
 
     # 5) 封面（群通知只发一条：等 PikPak 结果出来由 worker 统一发）
     cover = d.get("cover_url")
@@ -528,8 +531,7 @@ async def _build_start_panel(user_id: int, first_name: str) -> tuple[str, Inline
             "<code>/my</code> — 我的求片 · 📷 私聊发图 — 以图搜番"
         )
     else:
-        status, buser = await asyncio.get_running_loop().run_in_executor(
-            None, bbboss_client.get_user, user_id)
+        status, buser = await asyncio.get_running_loop().run_in_executor(_sync_executor, bbboss_client.get_user, user_id)
         if status == "ok" and buser:
             emby_name = buser.get("name")
             emby_line = f"📺 Emby 账号 | <code>{_esc(emby_name)}</code>" if emby_name else \
@@ -708,10 +710,8 @@ async def inline_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     d = result["detail"]
     number = d.get("number") or query.upper()
-    title_cn = await asyncio.get_running_loop().run_in_executor(
-        None, lambda: translate(d.get("title") or "", src="ja"))
-    detail = await asyncio.get_running_loop().run_in_executor(
-        None, build_detail, d, result["magnets"])
+    title_cn = await asyncio.get_running_loop().run_in_executor(_sync_executor, lambda: translate(d.get("title") or "", src="ja"))
+    detail = await asyncio.get_running_loop().run_in_executor(_sync_executor, build_detail, d, result["magnets"])
     await update.inline_query.answer(
         [InlineQueryResultArticle(
             id=number, title=f"🎬 {number}", description=title_cn[:80],
@@ -740,8 +740,7 @@ async def cmd_progress(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not task_id:
             lines.append(f"{head} — ⏳ 等待加入…")
             continue
-        ok, task = await loop.run_in_executor(
-            None, pikpak_client.get_task, task_id)
+        ok, task = await loop.run_in_executor(_sync_executor, pikpak_client.get_task, task_id)
         if not ok:
             lines.append(f"{head} — ⚠️ 查不到任务：{_esc(str(task)[:60])}")
             continue
@@ -949,29 +948,37 @@ async def _pikpak_worker(app: Application, rid: int, magnets: list,
         await _report("⏳", f"⏳ 状态：暂无磁力源，等待管理员手动提供磁力")
         return
 
-    magnet, label = _magnet_info(magnets[0])
-    if not magnet:
+    import asyncio as _aio
+    loop = _aio.get_running_loop()
+    tried_any = False
+    last_error = ""
+    last_magnet = ""
+    for m in magnets:
+        magnet, label = _magnet_info(m)
+        if not magnet:
+            continue
+        tried_any = True
+        last_magnet = magnet
+        ok, result = await loop.run_in_executor(_sync_executor, pikpak_client.add_offline_task, magnet, req["code"])
+        if ok:
+            db.update_status(rid, "pikpak_queued", magnet=magnet, pikpak_task_id=result)
+            log.info("#%d pikpak task %s: %s", rid, result, req["code"])
+            await _report("☁️",
+                          "☁️ 状态：已加入 PikPak 离线下载\n"
+                          f"🧲 {_esc(label[:80])}\n"
+                          "用 /progress 查看进度")
+            await _notify_admin(f"☁️ #{rid} <code>{_esc(req['code'])}</code> 已加入 PikPak 离线")
+            return
+        last_error = result or ""
+        log.warning("#%d magnet failed, trying next: %s", rid, last_error[:120])
+
+    if not tried_any:
         db.update_status(rid, "failed")
         await _report("❌", "❌ 状态：无可用磁力")
         return
-
-    import asyncio as _aio
-    loop = _aio.get_running_loop()
-    ok, result = await loop.run_in_executor(
-        None, pikpak_client.add_offline_task, magnet, req["code"])
-    if not ok:
-        db.update_status(rid, "failed", magnet=magnet)
-        await _report("❌", f"❌ 状态：加入 PikPak 失败：{_esc(result[:120])}")
-        await _notify_admin(f"❌ <b>#{rid}</b> 加入 PikPak 失败：{_esc(result[:120])}")
-        return
-
-    db.update_status(rid, "pikpak_queued", magnet=magnet, pikpak_task_id=result)
-    log.info("#%d pikpak task %s: %s", rid, result, req["code"])
-    await _report("☁️",
-                  "☁️ 状态：已加入 PikPak 离线下载\n"
-                  f"🧲 {_esc(label[:80])}\n"
-                  "用 /progress 查看进度")
-    await _notify_admin(f"☁️ #{rid} <code>{_esc(req['code'])}</code> 已加入 PikPak 离线")
+    db.update_status(rid, "failed", magnet=last_magnet)
+    await _report("❌", f"❌ 状态：加入 PikPak 失败：{_esc(last_error[:120])}")
+    await _notify_admin(f"❌ <b>#{rid}</b> 加入 PikPak 失败：{_esc(last_error[:120])}")
 
 
 def _cleanup_cover(cover_path: str | None):
@@ -1058,8 +1065,13 @@ async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- 定时检查入库 ----------
 _check_lock = asyncio.Lock()
 
+# 同步网络调用（翻译 / Emby / bb_boss / PikPak 的 urllib 部分）统一走这个池，
+# 不再挤默认 executor（2 核机器默认只有 6 个线程，大量并发 /s 会排队）。
+_sync_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="bot-sync")
+
 _request_locks: dict[str, asyncio.Lock] = {}
 _request_locks_guard = asyncio.Lock()
+_request_lock_users: dict[str, int] = {}
 
 
 @contextlib.asynccontextmanager
@@ -1067,12 +1079,23 @@ async def _request_lock(code: str):
     """同番号互斥锁：防止两人同时求同一番号双双通过查重、重复扣费。
 
     只包复查/扣费/插入这段临界区，fetch_movie 等慢操作在锁外，
-    不会把所有求片串行化。
+    不会把所有求片串行化。引用计数归零时删除锁，避免番号种类
+    无界增长。
     """
     async with _request_locks_guard:
         lock = _request_locks.setdefault(code, asyncio.Lock())
-    async with lock:
-        yield
+        _request_lock_users[code] = _request_lock_users.get(code, 0) + 1
+    try:
+        async with lock:
+            yield
+    finally:
+        async with _request_locks_guard:
+            left = _request_lock_users.get(code, 0) - 1
+            if left <= 0:
+                _request_lock_users.pop(code, None)
+                _request_locks.pop(code, None)
+            else:
+                _request_lock_users[code] = left
 
 
 async def check_library_once(app: Application):
@@ -1080,18 +1103,21 @@ async def check_library_once(app: Application):
 
     用 try_fulfill 做原子状态变更：并发的检查任务里只有一个能真正把
     状态翻成 fulfilled 并发通知，杜绝重复入库通知。
+    锁只包 try_fulfill 这一句，Emby 查询/发通知/sleep 都在锁外，
+    不再让一次检查长时间占着锁、把 webhook 触发的检查挡在外面。
     """
-    async with _check_lock:
-        rows = db.list_by_status()
-        for r in rows:
-            in_lib, lib_name = await asyncio.get_running_loop().run_in_executor(
-                None, emby_client.is_in_library, r["code"])
-            if in_lib:
-                if db.try_fulfill(r["id"]):
-                    await send_report(app, r, "自动入库报告", "🎊",
-                                      "✅ 状态：已存入媒体库，请刷新观看")
-                    log.info("request #%d fulfilled: %s", r["id"], r["code"])
-            await asyncio.sleep(2)
+    rows = db.list_by_status()
+    for r in rows:
+        in_lib, lib_name = await asyncio.get_running_loop().run_in_executor(
+            _sync_executor, emby_client.is_in_library, r["code"])
+        if in_lib:
+            async with _check_lock:
+                fulfilled = db.try_fulfill(r["id"])
+            if fulfilled:
+                await send_report(app, r, "自动入库报告", "🎊",
+                                  "✅ 状态：已存入媒体库，请刷新观看")
+                log.info("request #%d fulfilled: %s", r["id"], r["code"])
+        await asyncio.sleep(2)
 
 
 async def check_library_loop(app: Application):
@@ -1105,6 +1131,9 @@ async def check_library_loop(app: Application):
 
 
 # ---------- Emby webhook（即时入库通知） ----------
+_webhook_last_check = 0.0
+
+
 async def _emby_webhook_handler(request):
     """Emby webhook 插件 POST 到这里，library.new 时立即检查入库。"""
     bot_app = request.app["bot_app"]
@@ -1117,8 +1146,14 @@ async def _emby_webhook_handler(request):
         data = {}
     event = str(data.get("Event") or data.get("event") or "")
     log.info("emby webhook event: %s", event)
-    if "library" in event.lower() or not event:
-        asyncio.create_task(check_library_once(bot_app))
+    # 只认精确的 library.new（token 按要求不强制）；30 秒内重复触发合并为一次，
+    # 防止 Emby 连发多条时反复跑全量查询。空 event 不再触发。
+    if event.lower() == "library.new":
+        global _webhook_last_check
+        now = time.time()
+        if now - _webhook_last_check >= 30:
+            _webhook_last_check = now
+            asyncio.create_task(check_library_once(bot_app))
     return web.Response(text="ok")
 
 
