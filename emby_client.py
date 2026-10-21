@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 # 已知需要补数字前缀的番号系列：请求 GANA-2535，库里是 200GANA-2535
 # 200 系是业余番号的通用编目惯例（不只 GANA），见 _code_variants 的通用规则；
 # 这里只放不符合 200 惯例的特殊映射（如 MIUM -> 300MIUM）。
-_PREFIX_MAP = {"GANA": "200GANA"}
+_PREFIX_MAP = {"MIUM": "300MIUM"}
 
 
 def _code_variants(code: str) -> list[str]:

@@ -26,7 +26,6 @@ import shutil
 import subprocess
 import tempfile
 import time
-import urllib.request
 
 from telegram import (
     BotCommand,
@@ -945,7 +944,7 @@ async def _pikpak_worker(app: Application, rid: int, magnets: list,
         _cleanup_cover(cover_path)
 
     if not magnets:
-        await _report("⏳", f"⏳ 状态：暂无磁力源，等待管理员手动提供磁力")
+        await _report("⏳", "⏳ 状态：暂无磁力源，等待管理员手动提供磁力")
         return
 
     import asyncio as _aio
