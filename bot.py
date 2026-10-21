@@ -16,6 +16,7 @@
 入库后在反馈群通知。
 """
 import asyncio
+import contextlib
 import html
 import logging
 import os
@@ -242,16 +243,20 @@ async def send_result(msg, code: str):
     cover_path = await _download_cover(d.get("number") or "", cover) if cover else None
     cover_dir = os.path.dirname(cover_path) if cover_path else None
     if cover_path:
+        caption = await asyncio.get_running_loop().run_in_executor(
+            None, build_caption, d)
         try:
             with open(cover_path, "rb") as f:
-                await msg.reply_photo(photo=f, caption=build_caption(d),
+                await msg.reply_photo(photo=f, caption=caption,
                                       parse_mode=ParseMode.HTML, has_spoiler=True)
         except Exception as e:
             log.warning("send cover failed: %s", e)
         finally:
             if cover_dir:
                 shutil.rmtree(cover_dir, ignore_errors=True)
-    await msg.reply_text(build_detail(d, magnets)[:4000], parse_mode=ParseMode.HTML,
+    detail = await asyncio.get_running_loop().run_in_executor(
+        None, build_detail, d, magnets)
+    await msg.reply_text(detail[:4000], parse_mode=ParseMode.HTML,
                          disable_web_page_preview=True)
 
 
@@ -360,8 +365,9 @@ async def handle_request(msg, code: str, user_id: int, username: str, app: Appli
     code = code.strip().upper()
     thinking = await msg.reply_text(f"📩 正在处理求片 <code>{_esc(code)}</code>…", parse_mode=ParseMode.HTML)
 
-    # 1) 已在 Emby？
-    in_lib, lib_name = emby_client.is_in_library(code)
+    # 1) 已在 Emby？（同步 urllib，必须扔出 event loop）
+    in_lib, lib_name = await asyncio.get_running_loop().run_in_executor(
+        None, emby_client.is_in_library, code)
     if in_lib:
         await thinking.edit_text(
             f"✅ <code>{_esc(code)}</code> 已经在库了！\n{_esc(lib_name)}",
@@ -449,27 +455,37 @@ async def handle_request(msg, code: str, user_id: int, username: str, app: Appli
                                  parse_mode=ParseMode.HTML)
         return
     d = result["detail"]
-    title_cn = translate(d.get("title") or "", src="ja")
+    title_cn = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: translate(d.get("title") or "", src="ja"))
 
-    # 3.5) 扣子弹（每天前 N 次免费；bot 管理员免扣）
-    cost_info = ""
-    if rule:
-        _, _, cost, _, free = rule
-        if free:
-            cost_info = "（今日免费）"
-        else:
-            import asyncio as _aio_dd
-            ok, res = await _aio_dd.get_running_loop().run_in_executor(
-                None, bbboss_client.deduct_bullets, user_id, cost)
-            if not ok:
-                await thinking.edit_text(
-                    f"⚠️ 扣费失败（{_esc(str(res))}），本次求片未受理，请稍后再试。",
-                    parse_mode=ParseMode.HTML)
-                return
-            cost_info = f"（已扣 {cost} 子弹，余额 {res}）"
+    # 3.5) 扣子弹 + 入库：必须在同番号锁内先复查、再扣费、再插入。
+    # 否则两人同时求同一番号会在步骤 2 双双通过查重，然后重复扣费、
+    # 插出两条记录。每天前 N 次免费；bot 管理员免扣。
+    async with _request_lock(code):
+        dup2 = db.find_active_by_code(code)
+        if dup2:
+            await thinking.edit_text(
+                f"📮 <code>{_esc(code)}</code> 已经有人求过了（#{dup2['id']}），排队中…",
+                parse_mode=ParseMode.HTML)
+            return
+        cost_info = ""
+        if rule:
+            _, _, cost, _, free = rule
+            if free:
+                cost_info = "（今日免费）"
+            else:
+                import asyncio as _aio_dd
+                ok, res = await _aio_dd.get_running_loop().run_in_executor(
+                    None, bbboss_client.deduct_bullets, user_id, cost)
+                if not ok:
+                    await thinking.edit_text(
+                        f"⚠️ 扣费失败（{_esc(str(res))}），本次求片未受理，请稍后再试。",
+                        parse_mode=ParseMode.HTML)
+                    return
+                cost_info = f"（已扣 {cost} 子弹，余额 {res}）"
 
-    # 4) 入库
-    rid = db.add_request(code, title_cn, user_id, username)
+        # 4) 入库
+        rid = db.add_request(code, title_cn, user_id, username)
 
     # 5) 封面（群通知只发一条：等 PikPak 结果出来由 worker 统一发）
     cover = d.get("cover_url")
@@ -532,7 +548,7 @@ async def _build_start_panel(user_id: int, first_name: str) -> tuple[str, Inline
         text = (
             f"▎欢迎来到求片面板！{name}\n\n"
             f"· 🆔 TG ID | <code>{user_id}</code>\n"
-            f"· {emy_line}\n"
+            f"· {emby_line}\n"
             f"· 🍒 子弹 | {bullets}\n"
             f"· 📊 身份 | {ident}\n"
             f"· 🆓 今日免费剩余 | {free_left} 次\n\n"
@@ -692,13 +708,16 @@ async def inline_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     d = result["detail"]
     number = d.get("number") or query.upper()
-    title_cn = translate(d.get("title") or "", src="ja")
+    title_cn = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: translate(d.get("title") or "", src="ja"))
+    detail = await asyncio.get_running_loop().run_in_executor(
+        None, build_detail, d, result["magnets"])
     await update.inline_query.answer(
         [InlineQueryResultArticle(
             id=number, title=f"🎬 {number}", description=title_cn[:80],
             thumbnail_url=d.get("thumb_url"),
             input_message_content=InputTextMessageContent(
-                build_detail(d, result["magnets"])[:4000],
+                detail[:4000],
                 parse_mode=ParseMode.HTML, disable_web_page_preview=True))],
         cache_time=300)
 
@@ -881,7 +900,14 @@ def start_download(app: Application, rid: int, magnets: list,
     task = asyncio.create_task(
         _download_worker(app, rid, magnets, notify_chat_id, auto, cover_path))
     _download_tasks[rid] = task
-    task.add_done_callback(lambda t: _download_tasks.pop(rid, None))
+
+    def _on_done(t, rid=rid):
+        # 只清理仍指向本任务的引用：旧任务被取消后触发回调时，
+        # 若已有新任务替换，绝不能把新任务的引用 pop 掉。
+        if _download_tasks.get(rid) is t:
+            _download_tasks.pop(rid, None)
+
+    task.add_done_callback(_on_done)
     return task
 
 
@@ -1032,6 +1058,22 @@ async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- 定时检查入库 ----------
 _check_lock = asyncio.Lock()
 
+_request_locks: dict[str, asyncio.Lock] = {}
+_request_locks_guard = asyncio.Lock()
+
+
+@contextlib.asynccontextmanager
+async def _request_lock(code: str):
+    """同番号互斥锁：防止两人同时求同一番号双双通过查重、重复扣费。
+
+    只包复查/扣费/插入这段临界区，fetch_movie 等慢操作在锁外，
+    不会把所有求片串行化。
+    """
+    async with _request_locks_guard:
+        lock = _request_locks.setdefault(code, asyncio.Lock())
+    async with lock:
+        yield
+
 
 async def check_library_once(app: Application):
     """检查一次入库，有入库的发群通知（定时任务和 webhook 共用）。
@@ -1042,7 +1084,8 @@ async def check_library_once(app: Application):
     async with _check_lock:
         rows = db.list_by_status()
         for r in rows:
-            in_lib, lib_name = emby_client.is_in_library(r["code"])
+            in_lib, lib_name = await asyncio.get_running_loop().run_in_executor(
+                None, emby_client.is_in_library, r["code"])
             if in_lib:
                 if db.try_fulfill(r["id"]):
                     await send_report(app, r, "自动入库报告", "🎊",

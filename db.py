@@ -1,4 +1,5 @@
 """SQLite 求片记录。"""
+import contextlib
 import datetime
 import logging
 import sqlite3
@@ -41,11 +42,24 @@ def _migrate(c):
         c.execute("ALTER TABLE requests ADD COLUMN pikpak_task_id TEXT DEFAULT ''")
 
 
+@contextlib.contextmanager
 def _conn():
+    """打开一个 SQLite 连接，用完一定关闭。
+
+    原先直接返回连接、靠 `with sqlite3.Connection` 只 commit 不 close，
+    长期运行会累积连接直到 Too many open files；同时开 WAL +
+    busy_timeout，缓解并发写 database is locked。
+    """
     Path(config.DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(config.DB_PATH)
+    c = sqlite3.connect(config.DB_PATH, timeout=10)
     c.row_factory = sqlite3.Row
-    return c
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=5000")
+    try:
+        yield c
+        c.commit()
+    finally:
+        c.close()
 
 
 def init_db():
